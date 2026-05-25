@@ -2,7 +2,7 @@
 
 ![LangCode Agent GitHub poster](assets/github-poster.svg)
 
-LangCode 是一个基于 Langchain + LangGraph 构建的 Agent Loop 系统，支持自然语言对话、工具调用、限定在工作区内的文件操作、shell 执行、高风险工具的人工审批，以及基于 checkpoint 的会话恢复。
+LangCode，特点：1. LangChain + LangGraph + LLM = Agent Loop；2. Full-Duplex + Barge-in 语音交互。
 
 ## Mac 本地一键启动
 
