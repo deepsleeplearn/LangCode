@@ -1,0 +1,62 @@
+# macOS / editors
+.DS_Store
+.idea/
+.vscode/
+
+# Local development notes. Keep only the public README in the repo.
+/*.md
+!/README.md
+docs/
+
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+htmlcov/
+build/
+dist/
+*.egg-info/
+.venv/
+venv/
+
+# Node / frontend
+frontend/node_modules/
+frontend/dist/
+frontend/.vite/
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+pnpm-debug.log*
+
+# Local secrets. Keep the checked-in template.
+.env
+.env.*
+!.env.example
+
+# LangCode runtime state and local browser QA logs
+.langcode/
+.gstack/
+
+# Local databases, logs, and model/media artifacts
+*.sqlite
+*.sqlite-*
+*.db
+*.log
+*.wav
+*.mp3
+*.m4a
+*.flac
+*.ogg
+*.aiff
+*.pt
+*.npz
+*.bin
+*.onnx
+*.safetensors
+*.mlmodel
+models/
+checkpoints/
