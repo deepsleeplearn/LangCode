@@ -1,6 +1,8 @@
 # LangCode Agent
 
-LangCode Agent 是一个基于 LangGraph 构建的 Python CLI 代码 Agent。v1 实现 Claude Code 风格的核心循环：自然语言对话、工具调用、限定在工作区内的文件操作、shell 执行、高风险工具的人工审批，以及基于 checkpoint 的会话恢复。
+![LangCode Agent GitHub poster](assets/github-poster.svg)
+
+LangCode 是一个基于 Langchain + LangGraph 构建的 Agent Loop 系统，支持自然语言对话、工具调用、限定在工作区内的文件操作、shell 执行、高风险工具的人工审批，以及基于 checkpoint 的会话恢复。
 
 ## Mac 本地一键启动
 
@@ -92,6 +94,32 @@ export TAVILY_API_KEY="..."
 
 ## 语音与本地模型
 
+仓库会提交小体积的产品资产：
+
+- `.langcode/skills/process-relation-diagram/SKILL.md`：内置流程/关系图示 skill。
+- `.langcode/tts-voices/samples/`：`汪菊`、`雪芬` 的运行时音色样本。
+- `.langcode/tts-voices/profiles/`：两套音色 profile，避免用户首次使用时必须重新提取。
+- `.langcode/tts-voices/previews/`：Web UI 里可直接试听的内置音色预览。
+
+仓库不会提交大模型、数据库、缓存和会话状态。当前本机 `.langcode` 里这些内容体积较大，需要 clone 后按需下载或自动生成：
+
+| 路径 | 用途 | 是否提交 | 准备方式 |
+| --- | --- | --- | --- |
+| `.langcode/asr-models/Qwen3-ASR-0.6B` | 语音输入 ASR | 不提交，约 1.8GB | 可让 Transformers 自动下载，或运行 `python3 scripts/download_asr_model.py` |
+| `.langcode/turnsense-models/TurnSense` | 语义 VAD / 说话轮次结束判断 | 不提交，约 100MB | 运行 `python3 scripts/download_turnsense.py` |
+| `.langcode/tts-models/Fun-CosyVoice3-0.5B-2512-8bit` | `汪菊`、`雪芬` 自定义音色合成 | 不提交，约 1.3GB | 运行 `python3 scripts/download_tts_model.py` |
+| `.langcode/web.sqlite`、`.langcode/checkpoints.sqlite` | Web 会话和 LangGraph checkpoint | 不提交 | 首次启动自动创建 |
+| `.langcode/cache/`、`.langcode/artifacts/` | 本地缓存和大工具结果 | 不提交 | 运行时自动创建 |
+
+一键准备本地语音模型和自定义音色：
+
+```bash
+python3 scripts/download_asr_model.py
+python3 scripts/download_turnsense.py
+python3 scripts/download_tts_model.py
+PYTHONPATH=src python3 scripts/prepare_mlx_cosyvoice3.py
+```
+
 语音输入默认使用 Qwen3-ASR。Mac 上可显式使用 Apple MPS：
 
 ```bash
@@ -102,23 +130,20 @@ export LANGCODE_ASR_DTYPE="auto"
 语音播报支持两类路径：
 
 - 默认音色：使用 macOS `say`，不需要额外模型。
-- 自定义音色：使用本地 MLX/CosyVoice3。模型体积较大，不提交到 GitHub；clone 后需要把 MLX 兼容模型放到本地，并通过环境变量指向它。
+- 自定义音色：使用本地 MLX/CosyVoice3。模型体积较大，不提交到 GitHub；clone 后运行 `scripts/download_tts_model.py`，或把 MLX 兼容模型放到本地并通过环境变量指向它。
 
 自定义音色推荐配置：
 
 ```bash
 export LANGCODE_TTS_PROVIDER="auto"
-export LANGCODE_TTS_MODEL_DIR="/absolute/path/to/Fun-CosyVoice3-0.5B-2512-8bit"
+export LANGCODE_TTS_MODEL_DIR=".langcode/tts-models/Fun-CosyVoice3-0.5B-2512-8bit"
 export LANGCODE_TTS_VOICE_DIR=".langcode/tts-voices"
 export LANGCODE_TTS_WORKERS="2"
 ```
 
-内置的 `汪菊`、`雪芬` 自定义音色需要本地样本文件。样本文件属于本地音频资产，默认不提交到 Git。准备方式：
+内置的 `汪菊`、`雪芬` 自定义音色样本同时保留在仓库根目录和 `.langcode/tts-voices/samples/`。如果需要重新生成音色 profile 和预览：
 
 ```bash
-mkdir -p .langcode/tts-voices/samples
-cp /path/to/汪菊.wav .langcode/tts-voices/samples/wangju.wav
-cp /path/to/雪芬.wav .langcode/tts-voices/samples/xuefen.wav
 PYTHONPATH=src python3 scripts/prepare_mlx_cosyvoice3.py \
   --model-dir "$LANGCODE_TTS_MODEL_DIR" \
   --voice-dir .langcode/tts-voices
@@ -261,15 +286,7 @@ Web server 使用 Sanic 异步 HTTP 层。阻塞的模型调用和工具执行�
 
 ## 恢复与记忆
 
-项目为长任务维护了几个 Markdown 文件：
-
-- `SPEC.md`：产品与技术规格。
-- `GOAL.md`：可执行的长任务目标契约。
-- `DEVELOPMENT_LOG.md`：按时间记录的开发过程。
-- `AGENT_MEMORY.md`：供未来 session 或上下文压缩后继续工作的简明交接记忆。
-- `TESTING_ADVERSARIAL_LOG.md`：功能测试和对抗测试过程。
-
-运行时 session 状态保存在 `<workspace>/.langcode/`，该目录被 git 忽略。
+运行时 session 状态保存在 `<workspace>/.langcode/`。该目录下只有内置 skill 和小体积音色资产会随仓库提交，运行态数据仍被忽略。
 Web 会话、消息内容、重命名/删除等操作事件保存在 `<workspace>/.langcode/web.sqlite`。旧版 `.langcode/web-sessions/*.json` 和 `.langcode/web-session-metadata.json` 会在启动时自动迁移进 SQLite；迁移后不会再写新的 Web 会话 JSON 文件。
 LangGraph 工具审批/恢复 checkpoint 仍单独保存在 `<workspace>/.langcode/checkpoints.sqlite`，它不承载左侧栏会话列表。
 上下文压缩归档保存在 `<workspace>/.langcode/compactions/`。
@@ -313,7 +330,7 @@ printf '%s\n' \
 
 ## GitHub 发布前检查
 
-建议提交源码、测试、文档、`pyproject.toml`、`frontend/package.json`、`frontend/package-lock.json`、`.env.example` 和 `scripts/*.py` / `scripts/*.sh`。提交前运行：
+建议提交源码、测试、README、`pyproject.toml`、`frontend/package.json`、`frontend/package-lock.json`、`.env.example`、`scripts/*.py` / `scripts/*.sh`、`assets/github-poster.svg`、根目录两份内置音色样本，以及 `.langcode/skills/` 和 `.langcode/tts-voices/` 下被放开的内置资产。提交前运行：
 
 ```bash
 python3 scripts/check_release.py
@@ -322,7 +339,7 @@ python3 scripts/check_release.py
 不要提交以下本地生成或敏感内容，它们已由 `.gitignore` 覆盖：
 
 - `.env.local`、`.env` 等真实密钥配置。
-- `.langcode/`、`.gstack/`、SQLite 运行态和日志。
+- `.gstack/`、SQLite 运行态、日志、`.langcode/cache/`、`.langcode/artifacts/`、`.langcode/memories/`。
 - `.venv/`、`frontend/node_modules/`、`frontend/dist/`。
 - `__pycache__/`、`.pytest_cache/`、`*.pyc`。
-- 本地模型、checkpoint、音频样本和预览文件，例如 `*.wav`、`*.pt`、`*.safetensors`、`models/`。
+- 本地大模型、checkpoint、临时录音和服务测试音频，例如 `.langcode/asr-models/`、`.langcode/tts-models/`、`.langcode/turnsense-models/`、`*.pt`、`*.safetensors`、`models/`；根目录 `汪菊.wav`、`雪芬.wav` 和 `.langcode/tts-voices/` 下的内置样本/profile/预览会随项目提交。

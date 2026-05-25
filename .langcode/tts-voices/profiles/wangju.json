@@ -1,0 +1,9 @@
+{
+  "id": "wangju",
+  "name": "汪菊",
+  "style": "自定义音色：汪菊",
+  "refAudio": ".langcode/tts-voices/samples/wangju.wav",
+  "refText": "美国能源，但中方没有明确确认这个信息。说明这个信息差说明什么？是双方谈判口径不同，还是没有达成协议？现在没有达成协议。",
+  "sampleRate": 24000,
+  "createdAt": "2026-05-24T17:13:34Z"
+}

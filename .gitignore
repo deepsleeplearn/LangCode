@@ -38,8 +38,18 @@ pnpm-debug.log*
 !.env.example
 
 # LangCode runtime state and local browser QA logs
-.langcode/
 .gstack/
+
+# LangCode runtime state. Commit only small product assets under .langcode.
+.langcode/*
+!.langcode/skills/
+!.langcode/skills/**
+!.langcode/tts-voices/
+.langcode/tts-voices/*
+!.langcode/tts-voices/samples/
+!.langcode/tts-voices/profiles/
+!.langcode/tts-voices/previews/
+.langcode/tts-voices/previews/*_service_test.wav
 
 # Local databases, logs, and model/media artifacts
 *.sqlite
@@ -47,6 +57,8 @@ pnpm-debug.log*
 *.db
 *.log
 *.wav
+!/汪菊.wav
+!/雪芬.wav
 *.mp3
 *.m4a
 *.flac
@@ -60,3 +72,14 @@ pnpm-debug.log*
 *.mlmodel
 models/
 checkpoints/
+
+# Release assets intentionally kept under .langcode.
+!.langcode/skills/**
+!.langcode/tts-voices/samples/wangju.wav
+!.langcode/tts-voices/samples/xuefen.wav
+!.langcode/tts-voices/profiles/wangju.json
+!.langcode/tts-voices/profiles/wangju.npz
+!.langcode/tts-voices/profiles/xuefen.json
+!.langcode/tts-voices/profiles/xuefen.npz
+!.langcode/tts-voices/previews/wangju.wav
+!.langcode/tts-voices/previews/xuefen.wav

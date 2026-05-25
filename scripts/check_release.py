@@ -17,8 +17,22 @@ REQUIRED_FILES = [
     "frontend/package-lock.json",
     "frontend/src/main.jsx",
     "frontend/src/styles.css",
+    "assets/github-poster.svg",
+    "scripts/download_asr_model.py",
+    "scripts/download_tts_model.py",
     "scripts/start_macos.sh",
     "scripts/prepare_mlx_cosyvoice3.py",
+    "汪菊.wav",
+    "雪芬.wav",
+    ".langcode/skills/process-relation-diagram/SKILL.md",
+    ".langcode/tts-voices/samples/wangju.wav",
+    ".langcode/tts-voices/samples/xuefen.wav",
+    ".langcode/tts-voices/profiles/wangju.json",
+    ".langcode/tts-voices/profiles/wangju.npz",
+    ".langcode/tts-voices/profiles/xuefen.json",
+    ".langcode/tts-voices/profiles/xuefen.npz",
+    ".langcode/tts-voices/previews/wangju.wav",
+    ".langcode/tts-voices/previews/xuefen.wav",
 ]
 
 REQUIRED_GITIGNORE_PATTERNS = [
@@ -28,7 +42,9 @@ REQUIRED_GITIGNORE_PATTERNS = [
     ".env",
     ".env.*",
     "!.env.example",
-    ".langcode/",
+    ".langcode/*",
+    "!.langcode/skills/",
+    "!.langcode/tts-voices/",
     ".gstack/",
     "frontend/node_modules/",
     "frontend/dist/",
@@ -39,9 +55,15 @@ REQUIRED_GITIGNORE_PATTERNS = [
     "models/",
 ]
 
+ALLOWED_LANGCODE_PREFIXES = {
+    (".langcode", "skills"),
+    (".langcode", "tts-voices", "samples"),
+    (".langcode", "tts-voices", "profiles"),
+    (".langcode", "tts-voices", "previews"),
+}
+
 EXCLUDED_DIRS = {
     ".git",
-    ".langcode",
     ".gstack",
     ".venv",
     "venv",
@@ -161,11 +183,17 @@ def _iter_candidate_files():
         if not path.is_file():
             continue
         rel_parts = path.relative_to(ROOT).parts
+        if rel_parts and rel_parts[0] == ".langcode" and not _is_allowed_langcode_asset(rel_parts):
+            continue
         if any(part in EXCLUDED_DIRS for part in rel_parts):
             continue
         if len(rel_parts) == 1 and path.suffix.lower() == ".md" and path.name != "README.md":
             continue
         yield path
+
+
+def _is_allowed_langcode_asset(rel_parts: tuple[str, ...]) -> bool:
+    return any(rel_parts[: len(prefix)] == prefix for prefix in ALLOWED_LANGCODE_PREFIXES)
 
 
 if __name__ == "__main__":

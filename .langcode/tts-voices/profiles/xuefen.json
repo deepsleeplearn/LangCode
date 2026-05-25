@@ -1,0 +1,9 @@
+{
+  "id": "xuefen",
+  "name": "雪芬",
+  "style": "自定义音色：雪芬",
+  "refAudio": ".langcode/tts-voices/samples/xuefen.wav",
+  "refText": "考个牛逼的，那同学你要想考牛逼高校的话你觉得你考这点分还够用吗？就不够用了，因为在咱们中国有一帮牛逼高校，他们在考研的时候有一个特权，他们可以干嘛？",
+  "sampleRate": 24000,
+  "createdAt": "2026-05-24T17:13:40Z"
+}
