@@ -87,13 +87,49 @@ const DEFAULT_TTS_VOICE_OPTION = {
   previewText: '欢迎使用LangCode，你的最后一个智能体。',
 };
 
+const TTS_VOICE_ALIASES = {
+  汪菊: 'wangju',
+  雪芬: 'xuefen',
+};
+
+function ttsVoiceIdentity(voice) {
+  const id = String(voice?.id || '').trim();
+  const name = String(voice?.name || '').trim();
+  return (TTS_VOICE_ALIASES[id] || TTS_VOICE_ALIASES[name] || id || name).toLowerCase();
+}
+
+function preferTtsVoice(candidate, current) {
+  if (!current) return true;
+  if (candidate.id === DEFAULT_TTS_VOICE_OPTION.id) return true;
+  const candidateScore =
+    (candidate.provider === 'mlx-cosyvoice3' ? 8 : 0) +
+    (candidate.previewReady ? 4 : 0) +
+    (candidate.profileReady ? 2 : 0) +
+    (candidate.builtIn ? 1 : 0);
+  const currentScore =
+    (current.provider === 'mlx-cosyvoice3' ? 8 : 0) +
+    (current.previewReady ? 4 : 0) +
+    (current.profileReady ? 2 : 0) +
+    (current.builtIn ? 1 : 0);
+  return candidateScore > currentScore;
+}
+
 function normalizeTtsVoiceOptions(voices = []) {
   const normalized = Array.isArray(voices) ? voices.filter((voice) => voice?.id) : [];
   const output = normalized.map((voice) =>
     voice.id === DEFAULT_TTS_VOICE_OPTION.id ? { ...DEFAULT_TTS_VOICE_OPTION, ...voice, previewUrl: voice.previewUrl || DEFAULT_TTS_VOICE_OPTION.previewUrl, previewReady: true } : voice,
   );
-  const hasDefault = output.some((voice) => voice.id === DEFAULT_TTS_VOICE_OPTION.id);
-  return hasDefault ? output : [DEFAULT_TTS_VOICE_OPTION, ...output];
+  const withDefault = output.some((voice) => voice.id === DEFAULT_TTS_VOICE_OPTION.id) ? output : [DEFAULT_TTS_VOICE_OPTION, ...output];
+  const deduped = new Map();
+  for (const voice of withDefault) {
+    const identity = ttsVoiceIdentity(voice);
+    if (!identity) continue;
+    const current = deduped.get(identity);
+    if (preferTtsVoice(voice, current)) {
+      deduped.set(identity, voice);
+    }
+  }
+  return Array.from(deduped.values());
 }
 
 const SLASH_COMMANDS = [
@@ -1100,6 +1136,7 @@ function App() {
       if (currentToken) tokensToSuppress.add(currentToken);
     }
     for (const token of tokensToSuppress) ttsSuppressedTokensRef.current.add(token);
+    clearVoiceTtsPreparingForStoppedTokens(tokensToSuppress);
     ttsPlayingRef.current = false;
     if (clearQueue) {
       ttsQueueRef.current = [];
@@ -1333,6 +1370,28 @@ function App() {
               thinkingRunning: preparing ? false : message.thinkingRunning,
             }
           : message,
+      ),
+    );
+  }
+
+  function clearVoiceTtsPreparingForStoppedTokens(tokens) {
+    let clearedSpecificMessage = false;
+    for (const token of tokens || []) {
+      const parsed = parseTtsToken(token);
+      if (!parsed) continue;
+      clearedSpecificMessage = true;
+      setAssistantVoiceTtsPreparing(parsed.sessionId, parsed.assistantId, false);
+    }
+    if (!clearedSpecificMessage && activeSessionRef.current) {
+      clearVoiceTtsPreparingInSession(activeSessionRef.current);
+    }
+  }
+
+  function clearVoiceTtsPreparingInSession(targetSessionId) {
+    if (!targetSessionId) return;
+    updateSessionMessages(targetSessionId, (current) =>
+      current.map((message) =>
+        message.role === 'assistant' && message.voiceTtsPreparing ? { ...message, voiceTtsPreparing: false } : message,
       ),
     );
   }
@@ -3570,13 +3629,17 @@ function appendAssistantContentInMessages(messages, assistantId, content) {
 
 function archiveAssistantProgress(messages) {
   return messages.map((message) => {
-    if (message.role !== 'assistant' || !hasAssistantProgress(message)) return message;
+    if (message.role !== 'assistant') return message;
+    if (!hasAssistantProgress(message)) {
+      return message.voiceTtsPreparing ? { ...message, voiceTtsPreparing: false } : message;
+    }
     return {
       ...message,
       progress: emptyProgress(),
       todos: [],
       progressRunning: false,
       progressArchived: true,
+      voiceTtsPreparing: false,
     };
   });
 }
@@ -3638,6 +3701,16 @@ function stripMarkdownForSpeech(text) {
 
 function ttsToken(sessionId, assistantId) {
   return `${sessionId}:${assistantId}`;
+}
+
+function parseTtsToken(token) {
+  const value = String(token || '');
+  const separator = value.lastIndexOf(':');
+  if (separator <= 0 || separator >= value.length - 1) return null;
+  return {
+    sessionId: value.slice(0, separator),
+    assistantId: value.slice(separator + 1),
+  };
 }
 
 function splitTtsText(text, { force = false, compact = false } = {}) {
@@ -3824,7 +3897,6 @@ function composeBargeInToolInput(interruptText, context) {
 }
 
 function contentPlacementForMessage(message) {
-  if (String(message.content || '').trim()) return 'beforeProgress';
   return hasAssistantProgress(message) ? 'afterProgress' : 'beforeProgress';
 }
 
@@ -4065,7 +4137,7 @@ function Message({ message, t, showProgress = true }) {
     </div>
   ) : null;
   const contentNode = <MarkdownContent content={message.content} />;
-  const progressFirst = message.contentPlacement === 'afterProgress';
+  const progressFirst = hasInlineProgress || message.contentPlacement === 'afterProgress';
   return (
     <article className={`message ${message.role}${message.voiceDraft ? ' voice-draft' : ''}`}>
       {message.role !== 'assistant' && <div className="avatar">{icon}</div>}
@@ -4164,17 +4236,25 @@ function ThinkingBlock({ content, running, t }) {
 }
 
 function MarkdownContent({ content }) {
-  const normalizedContent = normalizeMathMarkdown(content || '');
+  const normalizedContent = normalizeMarkdownForDisplay(content || '');
   if (!normalizedContent.trim()) return null;
   return (
     <div className="markdown-body">
       <ReactMarkdown
         remarkPlugins={[remarkGfm, remarkMath]}
         rehypePlugins={[rehypeKatex]}
-        components={{ pre: MermaidPre }}
+        components={{ pre: MermaidPre, table: MarkdownTable }}
       >
         {normalizedContent}
       </ReactMarkdown>
+    </div>
+  );
+}
+
+function MarkdownTable({ children, ...props }) {
+  return (
+    <div className="markdown-table-wrap">
+      <table {...props}>{children}</table>
     </div>
   );
 }
@@ -4195,7 +4275,7 @@ function MermaidDiagram({ chart, title }) {
   const diagramId = useMemo(() => `mermaid-${crypto.randomUUID().replace(/-/g, '')}`, []);
   useEffect(() => {
     let cancelled = false;
-    const source = String(chart || '').trim();
+    const source = normalizeMermaidForRender(chart);
     if (!source) {
       setSvg('');
       setError('');
@@ -4235,17 +4315,203 @@ function MermaidDiagram({ chart, title }) {
   );
 }
 
+const MERMAID_SEQUENCE_RESERVED_IDS = new Set([
+  'actor',
+  'and',
+  'alt',
+  'break',
+  'critical',
+  'else',
+  'end',
+  'loop',
+  'note',
+  'opt',
+  'par',
+  'participant',
+  'rect',
+]);
+
+function normalizeMermaidForRender(chart) {
+  const source = String(chart || '').trim();
+  if (!source.startsWith('sequenceDiagram')) return source;
+  const reservedAliases = new Map();
+  const lines = source.split('\n');
+  const normalizedLines = lines.map((line) => {
+    const declaration = line.match(/^(\s*(?:actor|participant)\s+)([A-Za-z_][\w-]*)(\s+as\b.*)$/i);
+    if (!declaration) return line;
+    const originalId = declaration[2];
+    if (!MERMAID_SEQUENCE_RESERVED_IDS.has(originalId.toLowerCase())) return line;
+    const safeId = `${originalId}_node`;
+    reservedAliases.set(originalId, safeId);
+    return `${declaration[1]}${safeId}${declaration[3]}`;
+  });
+  if (!reservedAliases.size) return normalizedLines.join('\n');
+  return normalizedLines
+    .map((line) => replaceMermaidSequenceReservedReferences(line, reservedAliases))
+    .join('\n');
+}
+
+function replaceMermaidSequenceReservedReferences(line, aliases) {
+  if (/^\s*(?:actor|participant)\s+/i.test(line)) return line;
+  const colonIndex = line.indexOf(':');
+  if (colonIndex < 0) return replaceMermaidIds(line, aliases);
+  return `${replaceMermaidIds(line.slice(0, colonIndex), aliases)}${line.slice(colonIndex)}`;
+}
+
+function replaceMermaidIds(value, aliases) {
+  let result = String(value || '');
+  for (const [originalId, safeId] of aliases.entries()) {
+    result = result.replace(new RegExp(`\\b${escapeRegExp(originalId)}\\b`, 'g'), safeId);
+  }
+  return result;
+}
+
+function escapeRegExp(value) {
+  return String(value || '').replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+}
+
+function normalizeMarkdownForDisplay(content) {
+  return normalizeCompressedMarkdownTables(normalizeMathMarkdown(content));
+}
+
 function normalizeMathMarkdown(content) {
-  return content
+  return String(content || '')
     .replace(/\\\[((?:.|\n)*?)\\\]/g, (_match, math) => `\n$$\n${math.trim()}\n$$\n`)
     .replace(/\\\((.+?)\\\)/g, (_match, math) => `$${math.trim()}$`);
+}
+
+function normalizeCompressedMarkdownTables(content) {
+  const lines = normalizeMultilineCompressedMarkdownTables(String(content || '')).split('\n');
+  const normalizedLines = lines.flatMap((line) => {
+    const splitRows = splitCompressedMarkdownTableLine(line);
+    return splitRows.length ? splitRows : [line];
+  });
+  return normalizedLines.join('\n');
+}
+
+function normalizeMultilineCompressedMarkdownTables(content) {
+  const lines = String(content || '').split('\n');
+  const normalizedLines = [];
+  for (let index = 0; index < lines.length; index += 1) {
+    const line = lines[index];
+    if (!isCompressedMarkdownTableStart(line)) {
+      normalizedLines.push(line);
+      continue;
+    }
+
+    const block = [line];
+    let cursor = index + 1;
+    while (cursor < lines.length) {
+      const joined = block.join(' ');
+      const table = parseCompressedMarkdownTable(joined);
+      const nextLine = lines[cursor];
+      const nextTrimmed = String(nextLine || '').trim();
+      if (table?.isComplete && !nextTrimmed.startsWith('|')) break;
+      if (!nextTrimmed && table) break;
+      block.push(nextLine);
+      cursor += 1;
+      if (parseCompressedMarkdownTable(block.join(' '))?.isComplete) {
+        const nextAfterBlock = String(lines[cursor] || '').trim();
+        if (!nextAfterBlock.startsWith('|')) break;
+      }
+    }
+
+    const table = parseCompressedMarkdownTable(block.join(' '));
+    if (!table) {
+      normalizedLines.push(line);
+      continue;
+    }
+    normalizedLines.push(...formatCompressedMarkdownTable(table));
+    index = cursor - 1;
+  }
+  return normalizedLines.join('\n');
+}
+
+function isCompressedMarkdownTableStart(line) {
+  const value = String(line || '');
+  return (value.match(/\|/g) || []).length >= 4 && /\|\s*:?-{3,}:?\s*\|/.test(value);
+}
+
+function splitCompressedMarkdownTableLine(line) {
+  const table = parseCompressedMarkdownTable(line);
+  return table ? formatCompressedMarkdownTable(table) : [];
+}
+
+function parseCompressedMarkdownTable(line) {
+  const value = String(line || '');
+  if ((value.match(/\|/g) || []).length < 6) return null;
+  const firstPipe = value.indexOf('|');
+  if (firstPipe < 0) return null;
+  const prefix = value.slice(0, firstPipe).trimEnd();
+  const rawCells = value
+    .slice(firstPipe)
+    .split('|')
+    .slice(1)
+    .filter((cell) => cell.trim() !== '');
+  if (rawCells.length && !rawCells[rawCells.length - 1].trim()) rawCells.pop();
+  if (rawCells.length < 4) return null;
+
+  let columnCount = 0;
+  let separatorCellCount = 0;
+  let separatorStart = -1;
+  for (let index = 1; index < rawCells.length; index += 1) {
+    let separatorCount = 0;
+    while (isMarkdownTableSeparatorCell(rawCells[index + separatorCount])) separatorCount += 1;
+    if (separatorCount >= 1 && index >= 2) {
+      columnCount = index;
+      separatorCellCount = separatorCount;
+      separatorStart = index;
+      break;
+    }
+  }
+  if (!columnCount || rawCells.length < columnCount * 2) return null;
+
+  return {
+    prefix,
+    columnCount,
+    headerCells: rawCells.slice(0, columnCount),
+    dataCells: rawCells.slice(separatorStart + separatorCellCount),
+    isComplete: (rawCells.length - separatorStart - separatorCellCount) >= columnCount
+      && (rawCells.length - separatorStart - separatorCellCount) % columnCount === 0,
+  };
+}
+
+function formatCompressedMarkdownTable(table) {
+  const rows = [
+    `| ${table.headerCells.map((cell) => normalizeTableCellText(cell)).join(' | ')} |`,
+    `| ${Array.from({ length: table.columnCount }, () => '---').join(' | ')} |`,
+  ];
+  const completeDataCells = table.dataCells.slice(
+    0,
+    Math.floor(table.dataCells.length / table.columnCount) * table.columnCount,
+  );
+  for (let index = 0; index < completeDataCells.length; index += table.columnCount) {
+    rows.push(`| ${completeDataCells
+      .slice(index, index + table.columnCount)
+      .map((cell) => normalizeTableCellText(cell))
+      .join(' | ')} |`);
+  }
+  if (!rows.some((row) => isMarkdownTableSeparatorRow(row))) return [];
+  return table.prefix ? [table.prefix, '', ...rows, ''] : ['', ...rows, ''];
+}
+
+function normalizeTableCellText(cell) {
+  return String(cell || '').trim().replace(/\s+/g, ' ');
+}
+
+function isMarkdownTableSeparatorRow(row) {
+  return /^\|?\s*:?-{3,}:?\s*(\|\s*:?-{3,}:?\s*)+\|?\s*$/.test(String(row || '').trim());
+}
+
+function isMarkdownTableSeparatorCell(cell) {
+  return /^\s*:?-{3,}:?\s*$/.test(String(cell || ''));
 }
 
 function isLikelyStreamingMarkdownTableRow(line) {
   const trimmed = String(line || '').trim();
   if (!trimmed.startsWith('|')) return false;
   if ((trimmed.match(/\|/g) || []).length < 2) return false;
-  if (/^\|?\s*:?-{3,}:?\s*(\|\s*:?-{3,}:?\s*)+\|?\s*$/.test(trimmed)) return true;
+  if (isMarkdownTableSeparatorRow(trimmed)) return true;
   return /\|\s*[^|\s][^|]*$/.test(trimmed);
 }
 

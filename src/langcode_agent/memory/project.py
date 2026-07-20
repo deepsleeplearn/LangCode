@@ -17,6 +17,7 @@ PROJECT_CONTEXT_FILES = (
     "AGENT_MEMORY.md",
 )
 
+HERMES_SOUL_FILE = ".langcode/SOUL.md"
 HERMES_MEMORY_DIR = ".langcode/memories"
 HERMES_MEMORY_FILES = {"memory": "MEMORY.md", "user": "USER.md"}
 PROJECT_SKILLS_DIR = ".langcode/skills"
@@ -25,6 +26,11 @@ ENTRY_DELIMITER = "\n§\n"
 MEMORY_CHAR_LIMIT = 2200
 USER_CHAR_LIMIT = 1375
 DEFAULT_MEMORY_MAX_CHARS = MEMORY_CHAR_LIMIT + USER_CHAR_LIMIT + 1200
+DEFAULT_SOUL = (
+    "你是 LangCode，一个长期运行的中文代码 Agent。"
+    "你谨慎、务实、可审批、可记忆，优先帮助用户在当前工作区读代码、写代码、运行命令、搜索资料、沉淀经验。"
+    "你不会训练或修改底层模型权重；你的自进化来自记忆、技能、会话归档、定时任务和可审计的改进提案。"
+)
 _MEMORY_LOCK = threading.RLock()
 _SKILL_LOCK = threading.RLock()
 _INVISIBLE_CHARS = {"\u200b", "\u200c", "\u200d", "\u2060", "\ufeff", "\u202a", "\u202b", "\u202c", "\u202d", "\u202e"}
@@ -47,6 +53,11 @@ def load_project_context(workspace_root: str | Path, *, max_chars: int = DEFAULT
     ensure_hermes_memory_files(root)
     sections: list[str] = []
     remaining = max_chars
+    soul = load_soul(root)
+    if soul:
+        clipped = soul[:remaining]
+        sections.append(f"## SOUL.md（长期身份）\n{clipped}")
+        remaining -= len(clipped)
     memory_snapshot = render_hermes_memory_snapshot(root)
     if memory_snapshot:
         clipped = memory_snapshot[:remaining]
@@ -146,6 +157,45 @@ def handle_local_command(
         messages.append(AIMessage(content=reply))
         return reply
 
+    if stripped == "/soul":
+        messages.append(HumanMessage(content=user_text))
+        soul = load_soul(workspace_root)
+        reply = soul or "当前没有 SOUL 身份文件。"
+        messages.append(AIMessage(content=reply))
+        return reply
+
+    if stripped == "/evolve":
+        from .evolution import evolution_status
+
+        messages.append(HumanMessage(content=user_text))
+        status = evolution_status(workspace_root)
+        reply = (
+            "自进化状态：\n"
+            f"- SOUL：{status['layout']['soul']}\n"
+            f"- 热记忆：{status['layout']['memory']} / {status['layout']['user']}\n"
+            f"- 技能目录：{status['layout']['skills']}\n"
+            f"- 反思归档：{status['reflections']} 条\n"
+            f"- 改进提案：{status['proposals']} 条"
+        )
+        messages.append(AIMessage(content=reply))
+        return reply
+
+    if stripped == "/cron":
+        from .cron import cron_tool
+
+        messages.append(HumanMessage(content=user_text))
+        result = cron_tool(workspace_root, "list", {})
+        jobs = result.get("jobs") if isinstance(result, dict) else []
+        if not jobs:
+            reply = "当前没有本地定时任务。"
+        else:
+            reply = "本地定时任务：\n" + "\n".join(
+                f"- {job.get('name')}（{job.get('id')}）：{job.get('schedule')}，{job.get('status')}，下次 {job.get('next_run_at')}"
+                for job in jobs
+            )
+        messages.append(AIMessage(content=reply))
+        return reply
+
     if stripped == "/agents":
         messages.append(HumanMessage(content=user_text))
         reply = (
@@ -188,6 +238,51 @@ def hermes_memory_path(workspace_root: str | Path, target: str = "memory") -> Pa
     memory_dir = root / HERMES_MEMORY_DIR
     memory_dir.mkdir(parents=True, exist_ok=True)
     return memory_dir / HERMES_MEMORY_FILES[normalized]
+
+
+def hermes_soul_path(workspace_root: str | Path) -> Path:
+    root = Path(workspace_root).expanduser().resolve()
+    path = root / HERMES_SOUL_FILE
+    path.parent.mkdir(parents=True, exist_ok=True)
+    return path
+
+
+def load_soul(workspace_root: str | Path) -> str:
+    ensure_hermes_memory_files(workspace_root)
+    path = hermes_soul_path(workspace_root)
+    try:
+        return path.read_text(encoding="utf-8").strip()
+    except OSError:
+        return ""
+
+
+def soul_tool(workspace_root: str | Path, action: str, *, content: str = "") -> dict:
+    normalized_action = str(action or "read").strip().lower()
+    ensure_hermes_memory_files(workspace_root)
+    path = hermes_soul_path(workspace_root)
+    if normalized_action in {"read", "view", "list"}:
+        return {
+            "ok": True,
+            "action": "read",
+            "path": _relative_memory_path(path, workspace_root),
+            "content": path.read_text(encoding="utf-8") if path.exists() else "",
+        }
+    if normalized_action in {"write", "replace", "update"}:
+        text = str(content or "").strip()
+        if not text:
+            return {"ok": False, "error": "SOUL 内容不能为空"}
+        scan_error = _scan_memory_content(text)
+        if scan_error:
+            return {"ok": False, "error": scan_error}
+        with _MEMORY_LOCK:
+            path.write_text(text, encoding="utf-8")
+        return {
+            "ok": True,
+            "action": "write",
+            "path": _relative_memory_path(path, workspace_root),
+            "content": text,
+        }
+    return {"ok": False, "error": f"未知 soul 操作：{action}"}
 
 
 def memory_tool(workspace_root: str | Path, action: str, *, target: str = "memory", content: str = "", old: str = "") -> dict:
@@ -393,6 +488,10 @@ def render_hermes_memory_snapshot(workspace_root: str | Path) -> str:
 
 def ensure_hermes_memory_files(workspace_root: str | Path) -> None:
     root = Path(workspace_root).expanduser().resolve()
+    soul_path = root / HERMES_SOUL_FILE
+    soul_path.parent.mkdir(parents=True, exist_ok=True)
+    if not soul_path.exists():
+        soul_path.write_text(DEFAULT_SOUL, encoding="utf-8")
     memory_dir = root / HERMES_MEMORY_DIR
     memory_dir.mkdir(parents=True, exist_ok=True)
     for filename in HERMES_MEMORY_FILES.values():

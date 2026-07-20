@@ -159,7 +159,16 @@ class TtsService:
     def list_voices(self) -> list[dict[str, Any]]:
         voices: list[dict[str, Any]] = [self._system_voice_payload()]
         voices.extend(self._mlx.voices())
-        voices.extend(self._remote_voice_profiles(existing={str(item["id"]) for item in voices}))
+        existing = {_voice_identity(item) for item in voices}
+        existing_ids = {str(item["id"]) for item in voices}
+        for voice in self._local_voice_profiles():
+            voice_id = str(voice.get("id") or "")
+            identity = _voice_identity(voice)
+            if voice_id and voice_id not in existing_ids and identity not in existing:
+                existing_ids.add(voice_id)
+                existing.add(identity)
+                voices.append(voice)
+        voices.extend(self._remote_voice_profiles(existing=existing_ids, existing_identities=existing))
         return voices
 
     def create_voice_profile(self, *, name: str, prompt_text: str, style: str, wav_bytes: bytes) -> dict[str, Any]:
@@ -321,9 +330,10 @@ class TtsService:
         }
         return payload
 
-    def _remote_voice_profiles(self, *, existing: set[str]) -> list[dict[str, Any]]:
+    def _remote_voice_profiles(self, *, existing: set[str], existing_identities: set[str] | None = None) -> list[dict[str, Any]]:
         if not self.settings.base_url:
             return []
+        existing_identities = existing_identities if existing_identities is not None else set()
         voices: list[dict[str, Any]] = []
         for endpoint in ("/api/tts/voices", "/v1/audio/voices", "/voices"):
             try:
@@ -341,9 +351,11 @@ class TtsService:
                 if not isinstance(item, dict):
                     continue
                 voice_id = str(item.get("id") or item.get("voice") or "").strip()
-                if not voice_id or voice_id in existing:
+                identity = _voice_identity({"id": voice_id, "name": item.get("name") or voice_id})
+                if not voice_id or voice_id in existing or identity in existing_identities:
                     continue
                 existing.add(voice_id)
+                existing_identities.add(identity)
                 voices.append(
                     {
                         "id": voice_id,
@@ -566,6 +578,18 @@ def _say_available() -> bool:
 
 def _is_system_voice_id(voice_id: str = "") -> bool:
     return (voice_id or "").strip().lower() in {SYSTEM_VOICE_ID, "system", "say", "macos-say", "system-say"}
+
+
+_VOICE_ID_ALIASES = {
+    "汪菊": "wangju",
+    "雪芬": "xuefen",
+}
+
+
+def _voice_identity(voice: dict[str, Any]) -> str:
+    voice_id = str(voice.get("id") or "").strip()
+    name = str(voice.get("name") or "").strip()
+    return (_VOICE_ID_ALIASES.get(voice_id) or _VOICE_ID_ALIASES.get(name) or voice_id or name).casefold()
 
 
 def _slugify(value: str) -> str:

@@ -51,7 +51,7 @@ def test_asr_status_does_not_load_model(monkeypatch):
 
     assert status["state"] == "idle"
     assert status["model"] == "fake-model"
-    assert status["audioVad"]["energyThreshold"] == 0.020
+    assert status["audioVad"]["energyThreshold"] == 0.014
     assert status["semanticVad"]["enabled"] is True
 
 

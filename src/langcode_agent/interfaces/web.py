@@ -34,6 +34,7 @@ from ..runtime.permissions import ToolCall, remember_shell_permission
 from ..storage.job_queue import JobQueue
 from ..storage.runtime_state import RuntimeLockTimeout, RuntimeStateStore
 from ..storage.session_store import SessionStore
+from ..memory.evolution import reflect_session
 from ..voice.tts import TtsService, content_type_for_path
 from ..voice.turnsense import TurnSenseService
 from .voice_proxy import VoiceWorkerClient
@@ -59,6 +60,7 @@ class WebSession:
     model: Any | None = None
     todos: list[dict] = field(default_factory=list)
     store_path: Path | None = None
+    last_reflected_count: int = 0
 
 
 class WebApp:
@@ -139,6 +141,7 @@ class WebApp:
                 pending=stored.get("pending") if stored else None,
                 todos=list((state or {}).get("todos") or []) if stored else [],
                 store_path=self.store.path,
+                last_reflected_count=int((state or {}).get("last_reflected_count") or 0) if stored else 0,
             )
             self.sessions[session_id] = session
             return session
@@ -175,6 +178,7 @@ class WebApp:
             session.display_messages = display_messages
             session.pending = stored.get("pending")
             session.todos = list((state or {}).get("todos") or [])
+            session.last_reflected_count = int((state or {}).get("last_reflected_count") or 0)
 
     def status(self) -> dict:
         settings = model_settings_from_env()
@@ -951,7 +955,8 @@ end run
                 return
 
             tool_calls = list(getattr(full_chunk, "tool_calls", None) or [])
-            ai_message = AIMessage(content="".join(partial_content), tool_calls=tool_calls)
+            ai_content = "".join(partial_content)
+            ai_message = AIMessage(content=ai_content, tool_calls=tool_calls)
             session.messages.append(ai_message)
             session.display_messages.append(ai_message)
 
@@ -1235,8 +1240,33 @@ end run
             str(session.workspace_root),
             serializable,
             pending=session.pending,
-            state={"todos": session.todos, "display_messages": _serialize_messages(display_messages)},
+            state={
+                "todos": session.todos,
+                "display_messages": _serialize_messages(display_messages),
+                "last_reflected_count": session.last_reflected_count,
+            },
         )
+        if _auto_reflect_enabled() and extra_ai_content is None and session.pending is None:
+            if len(serializable) > session.last_reflected_count and messages and isinstance(messages[-1], AIMessage):
+                reflect_session(
+                    session.workspace_root,
+                    session_id=session.id,
+                    messages=serializable,
+                    todos=session.todos,
+                    apply=True,
+                )
+                session.last_reflected_count = len(serializable)
+                self.store.save_messages(
+                    session.id,
+                    str(session.workspace_root),
+                    serializable,
+                    pending=session.pending,
+                    state={
+                        "todos": session.todos,
+                        "display_messages": _serialize_messages(display_messages),
+                        "last_reflected_count": session.last_reflected_count,
+                    },
+                )
 
 
 def _system_message(workspace_root: Path):
@@ -1727,6 +1757,14 @@ def _progress_target(tool_name: str, tool_input: dict) -> str:
         return str(tool_input.get("query") or "")
     if tool_name == "web_fetch":
         return str(tool_input.get("url") or "")
+    if tool_name == "memory":
+        return str(tool_input.get("target") or "memory")
+    if tool_name == "soul":
+        return "SOUL.md"
+    if tool_name == "self_evolve":
+        return str(tool_input.get("action") or "status")
+    if tool_name == "cron":
+        return str(tool_input.get("name") or tool_input.get("job_id") or tool_input.get("action") or "list")
     if tool_name == "shell":
         return str(tool_input.get("command") or "")
     if tool_name == "sandbox_shell":
@@ -2356,11 +2394,14 @@ def _tool_result_succeeded(value: Any) -> bool:
 
 
 def _prepare_tool_input(tool_name: str, tool_input: dict, session: WebSession) -> dict:
-    if tool_name in {"session_search", "delegate_agents", "agent_debate"}:
+    if tool_name in {"session_search", "delegate_agents", "agent_debate", "self_evolve"}:
         prepared = dict(tool_input)
         prepared["_current_session_id"] = session.id
         if session.store_path is not None:
             prepared["_session_store_path"] = str(session.store_path)
+        if tool_name == "self_evolve":
+            prepared["messages"] = _serialize_messages(session.messages)
+            prepared["todos"] = list(session.todos)
         return prepared
     return tool_input
 
@@ -2416,6 +2457,11 @@ def _float_env(name: str, fallback: float) -> float:
         return float(os.getenv(name, str(fallback)))
     except (TypeError, ValueError):
         return fallback
+
+
+def _auto_reflect_enabled() -> bool:
+    raw = os.getenv("LANGCODE_AUTO_REFLECT", "1").strip().lower()
+    return raw not in {"0", "false", "no", "off"}
 
 
 async def _static_response(web_app: WebApp, requested: str):

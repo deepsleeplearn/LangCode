@@ -33,7 +33,7 @@ class ShellRisk:
 
 
 TASK_TOOLS = {"task_create", "task_update", "task_list", "task_get", "task_cancel"}
-MEMORY_TOOLS = {"memory", "session_search", "skill", "diagram"}
+MEMORY_TOOLS = {"memory", "soul", "self_evolve", "cron", "session_search", "skill", "diagram"}
 AUTO_ALLOWED_TOOLS = {"read_file", "search", "ls", "glob", "web_search", "web_fetch", *TASK_TOOLS, *MEMORY_TOOLS}
 APPROVAL_REQUIRED_TOOLS = {"write_file", "edit_file"}
 SHELL_TOOL_NAME = "shell"

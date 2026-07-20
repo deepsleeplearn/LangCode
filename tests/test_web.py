@@ -72,6 +72,27 @@ def test_web_chat_events_refreshes_old_session_system_prompt_to_hermes_memory(tm
     assert "旧版记忆不应加载" not in system_text
 
 
+def test_web_chat_events_auto_reflects_once_and_persists_cursor(tmp_path: Path, monkeypatch) -> None:
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setenv("ZHIPU_API_KEY", "test-key")
+    app = WebApp(tmp_path, tmp_path)
+    session = app.get_session("reflect-session")
+    session.model = FakeCaptureMessagesStreamingModel()
+
+    events = list(app.chat_events({"sessionId": "reflect-session", "message": "以后默认先跑快速测试。"}))
+
+    assert events[-1] == {"type": "done", "ok": True}
+    assert "以后默认先跑快速测试" in (tmp_path / ".langcode" / "memories" / "USER.md").read_text(encoding="utf-8")
+    stored = app.store.load_session("reflect-session")
+    assert stored is not None
+    assert stored["state"]["last_reflected_count"] > 0
+    before = (tmp_path / ".langcode" / "evolution" / "reflections.jsonl").read_text(encoding="utf-8")
+
+    app._save_history(session)
+    after = (tmp_path / ".langcode" / "evolution" / "reflections.jsonl").read_text(encoding="utf-8")
+    assert after == before
+
+
 def test_voice_mode_prompt_forbids_meta_format_preamble() -> None:
     prompt = str(_voice_mode_messages(True)[0].content)
 

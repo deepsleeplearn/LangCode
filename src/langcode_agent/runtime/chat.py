@@ -131,7 +131,12 @@ class ChatSession:
                 _current_session_id=self.thread_id,
                 **dict(raw_tool_call.get("args", {})),
             ))
-        tool_call = ToolCall(raw_tool_call["name"], dict(raw_tool_call.get("args", {})))
+        tool_input = dict(raw_tool_call.get("args", {}))
+        if raw_tool_call["name"] == "self_evolve":
+            tool_input.setdefault("_current_session_id", self.thread_id)
+            tool_input.setdefault("messages", self.export_history())
+            tool_input.setdefault("todos", list(self.todos))
+        tool_call = ToolCall(raw_tool_call["name"], tool_input)
         result = self.agent.request_tool(tool_call, thread_id=self.thread_id)
         if "__interrupt__" in result:
             payload = result["__interrupt__"][0].value
@@ -470,6 +475,73 @@ def tool_schemas(*, include_delegation: bool = True) -> list[dict]:
             },
         ),
         _function_schema(
+            "soul",
+            "管理 LangCode 的 Hermes 风格长期身份文件 SOUL.md。SOUL 定义 Agent 稳定身份、语气和默认行为；不要写入项目临时规则。",
+            {
+                "type": "object",
+                "properties": {
+                    "action": {
+                        "type": "string",
+                        "enum": ["read", "write"],
+                        "default": "read",
+                    },
+                    "content": {"type": "string", "description": "write 时的新 SOUL 内容。"},
+                },
+                "required": ["action"],
+            },
+        ),
+        _function_schema(
+            "self_evolve",
+            "运行可审计的自进化流程：查看状态、反思当前会话、归档经验、生成技能/提示词/工具描述改进提案。高置信偏好可写入记忆，低置信内容只生成候选。",
+            {
+                "type": "object",
+                "properties": {
+                    "action": {
+                        "type": "string",
+                        "enum": [
+                            "status",
+                            "reflect_session",
+                            "list_reflections",
+                            "propose",
+                            "list_proposals",
+                            "read_soul",
+                            "update_soul",
+                        ],
+                        "default": "status",
+                    },
+                    "session_id": {"type": "string", "description": "需要反思的会话 ID，默认当前会话。"},
+                    "apply": {"type": "boolean", "default": True, "description": "是否自动应用高置信候选。"},
+                    "title": {"type": "string", "description": "propose 时的提案标题。"},
+                    "target": {"type": "string", "description": "propose 时的优化对象，如 skill、prompt、tool_description、code。"},
+                    "content": {"type": "string", "description": "提案正文或 SOUL 新内容。"},
+                    "limit": {"type": "integer", "default": 20},
+                },
+                "required": ["action"],
+            },
+        ),
+        _function_schema(
+            "cron",
+            "管理 LangCode 本地定时任务。任务可绑定 skills，支持创建、查看、暂停、恢复、删除、查询到期任务和记录运行结果。",
+            {
+                "type": "object",
+                "properties": {
+                    "action": {
+                        "type": "string",
+                        "enum": ["list", "create", "update", "delete", "pause", "resume", "run_due", "run"],
+                        "default": "list",
+                    },
+                    "job_id": {"type": "string"},
+                    "name": {"type": "string"},
+                    "prompt": {"type": "string"},
+                    "schedule": {"type": "string", "description": "例如 every 60 minutes、every 2 hours、daily 09:00。"},
+                    "skills": {"type": "array", "items": {"type": "string"}, "default": []},
+                    "status": {"type": "string", "enum": ["active", "paused"]},
+                    "result": {"type": "string", "description": "run 时记录的执行结果。"},
+                },
+                "required": ["action"],
+            },
+        ),
+        _function_schema(
             "session_search",
             "搜索或浏览本地 SQLite 会话历史；用于回忆过去对话、查找已完成方案、定位某条历史消息附近上下文。",
             {
@@ -707,11 +779,14 @@ def default_system_prompt(workspace_root: str) -> str:
         "Debate Manager 会维护 transcript，并让 A/B/Judge 按轮次发言。"
         "只要需要解释流程、关系、架构、调用链、状态转换、数据流、审批流、任务依赖或协作逻辑，就使用 diagram 生成可视化图。"
         "长期记忆遵循 Hermes 风格：MEMORY 保存项目事实/决策/经验，USER 保存稳定用户偏好；"
-        "必要时使用 memory 工具增删改查，使用 session_search 回忆历史会话。"
+        "SOUL 保存你的长期身份、语气和默认行为；必要时使用 soul 或 memory 工具增删改查，使用 session_search 回忆历史会话。"
         "遇到相似复杂任务时，先用 skill 列出并读取相关技能；"
         "复杂任务完成后，如果得到可复用流程、验证方法或踩坑经验，应在最终回答前使用 skill 沉淀或更新技能。"
+        "任务完成、用户纠正、发现稳定偏好、踩坑后恢复、形成可复用流程时，使用 self_evolve 反思会话；"
+        "高置信用户偏好或工程经验可以写入 USER/MEMORY，低置信技能、提示词、工具描述或代码优化只能生成可审计提案。"
+        "用户要求周期性检查、提醒、监控或例行任务时，使用 cron 创建或管理本地定时任务，可绑定相关 skills。"
         "本地命令：/compact 用于压缩较早的对话上下文，/memory 用于查看项目记忆，"
-        "/agents 用于列出内置子 Agent，以 # 开头的行会保存项目记忆。"
+        "/agents 用于列出内置子 Agent，/skills 查看技能，/evolve 查看自进化状态，/cron 查看定时任务，以 # 开头的行会保存项目记忆。"
         "向用户说明进展时保持简洁，并严格遵守人工审批结果。"
         "如果需要输出 Markdown 表格，必须使用合法 GFM 表格：表头、分隔行和每一行都必须各占一行；"
         "分隔行列数必须与表头一致；每个数据行列数也必须与表头一致；不要把多行表格压缩到同一行。"

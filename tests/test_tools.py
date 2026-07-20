@@ -101,6 +101,18 @@ def test_memory_tool_manages_bounded_hermes_markdown_files(tmp_path: Path) -> No
     assert "默认使用简体中文" in memory_file.read_text(encoding="utf-8")
 
 
+def test_soul_tool_reads_and_updates_identity_file(tmp_path: Path) -> None:
+    viewed = execute_tool(tmp_path, "soul", {"action": "read"})
+
+    assert viewed["ok"] is True
+    assert "LangCode" in viewed["content"]
+
+    updated = execute_tool(tmp_path, "soul", {"action": "write", "content": "你是稳定的中文代码 Agent。"})
+
+    assert updated["ok"] is True
+    assert (tmp_path / ".langcode" / "SOUL.md").read_text(encoding="utf-8") == "你是稳定的中文代码 Agent。"
+
+
 def test_memory_tool_rejects_over_limit_and_suspicious_content(tmp_path: Path) -> None:
     too_large = execute_tool(tmp_path, "memory", {"action": "add", "content": "x" * 2300})
     assert too_large["ok"] is False
@@ -171,6 +183,139 @@ def test_skill_tool_upserts_reads_and_lists_project_skill(tmp_path: Path) -> Non
     read = execute_tool(tmp_path, "skill", {"action": "read", "name": "sqlite-history-repair"})
     assert read["ok"] is True
     assert "孤立工具消息" in read["content"]
+
+
+def test_self_evolve_reflects_explicit_user_preference(tmp_path: Path) -> None:
+    result = execute_tool(
+        tmp_path,
+        "self_evolve",
+        {
+            "action": "reflect_session",
+            "session_id": "s1",
+            "messages": [
+                {"role": "human", "content": "以后默认先跑快速测试。"},
+                {"role": "ai", "content": "收到。"},
+            ],
+            "apply": True,
+        },
+    )
+
+    assert result["ok"] is True
+    assert result["applied"]
+    assert "以后默认先跑快速测试" in (tmp_path / ".langcode" / "memories" / "USER.md").read_text(encoding="utf-8")
+    assert (tmp_path / ".langcode" / "evolution" / "reflections.jsonl").exists()
+
+
+def test_self_evolve_stages_low_confidence_skill_candidate(tmp_path: Path) -> None:
+    result = execute_tool(
+        tmp_path,
+        "self_evolve",
+        {
+            "action": "reflect_session",
+            "session_id": "s2",
+            "messages": [
+                {"role": "human", "content": "修复前端 Markdown 表格渲染"},
+                {"role": "ai", "content": "已经修复并验证。"},
+            ],
+            "todos": [
+                {"content": "定位渲染问题", "status": "completed"},
+                {"content": "修复流式表格缓冲", "status": "completed"},
+            ],
+            "apply": True,
+        },
+    )
+
+    assert result["ok"] is True
+    assert result["staged"]
+    assert not list((tmp_path / ".langcode" / "skills").glob("workflow-*/SKILL.md"))
+
+
+def test_self_evolve_skips_empty_reflection_without_writing_log(tmp_path: Path) -> None:
+    result = execute_tool(
+        tmp_path,
+        "self_evolve",
+        {
+            "action": "reflect_session",
+            "session_id": "empty",
+            "messages": [
+                {"role": "human", "content": "你好"},
+                {"role": "ai", "content": "你好，有什么可以帮你？"},
+            ],
+            "apply": True,
+        },
+    )
+
+    assert result["ok"] is True
+    assert result["skipped"] == "no_candidates"
+    assert not (tmp_path / ".langcode" / "evolution" / "reflections.jsonl").exists()
+
+
+def test_self_evolve_auto_writes_skill_after_complex_completed_workflow(tmp_path: Path) -> None:
+    result = execute_tool(
+        tmp_path,
+        "self_evolve",
+        {
+            "action": "reflect_session",
+            "session_id": "s3",
+            "messages": [
+                {"role": "human", "content": "为前端实现可靠的语音播报流水线"},
+                {"role": "ai", "content": "已经实现并通过端到端验证。"},
+            ],
+            "todos": [
+                {"content": "定位重复播报根因", "status": "completed"},
+                {"content": "重构 TTS 分块队列", "status": "completed"},
+                {"content": "补充回归测试", "status": "completed"},
+            ],
+            "apply": True,
+        },
+    )
+
+    assert result["ok"] is True
+    assert any(item["kind"] == "skill" for item in result["applied"])
+    assert list((tmp_path / ".langcode" / "skills").glob("workflow-*/SKILL.md"))
+
+
+def test_self_evolve_writes_auditable_proposal(tmp_path: Path) -> None:
+    result = execute_tool(
+        tmp_path,
+        "self_evolve",
+        {
+            "action": "propose",
+            "title": "优化工具描述",
+            "target": "tool_description",
+            "content": "把 cron 工具描述改得更短。",
+        },
+    )
+
+    assert result["ok"] is True
+    proposal = tmp_path / result["path"]
+    assert proposal.exists()
+    assert "优化工具描述" in proposal.read_text(encoding="utf-8")
+
+
+def test_cron_tool_manages_local_jobs(tmp_path: Path) -> None:
+    created = execute_tool(
+        tmp_path,
+        "cron",
+        {
+            "action": "create",
+            "name": "每日总结",
+            "prompt": "总结昨天会话中的工程经验。",
+            "schedule": "daily 09:00",
+            "skills": ["session-summary"],
+        },
+    )
+
+    assert created["ok"] is True
+    job_id = created["job"]["id"]
+    listed = execute_tool(tmp_path, "cron", {"action": "list"})
+    assert listed["jobs"][0]["name"] == "每日总结"
+
+    paused = execute_tool(tmp_path, "cron", {"action": "pause", "job_id": job_id})
+    assert paused["job"]["status"] == "paused"
+
+    removed = execute_tool(tmp_path, "cron", {"action": "delete", "job_id": job_id})
+    assert removed["ok"] is True
 
 
 def test_diagram_tool_generates_langchain_mermaid_graph(tmp_path: Path) -> None:

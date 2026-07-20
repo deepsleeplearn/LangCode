@@ -4,7 +4,7 @@
 .vscode/
 
 # Local development notes. Keep only the public README in the repo.
-/*.md
+markdown/
 !/README.md
 docs/
 

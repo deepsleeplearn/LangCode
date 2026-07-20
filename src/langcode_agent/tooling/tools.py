@@ -7,7 +7,9 @@ import subprocess
 from ..core.paths import WorkspaceViolation, resolve_workspace_path
 from .web_tools import web_fetch, web_search
 from .diagram import diagram_tool
-from ..memory.project import memory_tool, skill_tool
+from ..memory.cron import cron_tool
+from ..memory.evolution import self_evolution_tool
+from ..memory.project import memory_tool, skill_tool, soul_tool
 from ..storage.session_store import SessionStore
 
 
@@ -183,6 +185,24 @@ def execute_tool(
             target=str(tool_input.get("target") or "memory"),
             content=str(tool_input.get("content") or ""),
             old=str(tool_input.get("old") or ""),
+        )
+    if tool_name == "soul":
+        return soul_tool(
+            workspace_root,
+            str(tool_input.get("action") or "read"),
+            content=str(tool_input.get("content") or ""),
+        )
+    if tool_name == "self_evolve":
+        return self_evolution_tool(
+            workspace_root,
+            str(tool_input.get("action") or "status"),
+            dict(tool_input),
+        )
+    if tool_name == "cron":
+        return cron_tool(
+            workspace_root,
+            str(tool_input.get("action") or "list"),
+            dict(tool_input),
         )
     if tool_name == "session_search":
         return session_search_tool(workspace_root, tool_input)

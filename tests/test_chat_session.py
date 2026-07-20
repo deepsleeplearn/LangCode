@@ -46,6 +46,9 @@ def test_tool_schemas_include_core_code_tools() -> None:
         "web_search",
         "web_fetch",
         "memory",
+        "soul",
+        "self_evolve",
+        "cron",
         "session_search",
         "skill",
         "diagram",
@@ -153,7 +156,7 @@ def test_aimp_glm_is_default_openai_compatible_provider(monkeypatch) -> None:
 
 def test_openai_provider_can_still_be_selected(monkeypatch) -> None:
     monkeypatch.setenv("LANGCODE_PROVIDER", "openai")
-    monkeypatch.delenv("LANGCODE_OPENAI_GATEWAY", raising=False)
+    monkeypatch.setenv("LANGCODE_OPENAI_GATEWAY", "")
     monkeypatch.setenv("OPENAI_API_KEY", "openai-key")
     monkeypatch.setenv("OPENAI_BASE_URL", "https://example.test/v1")
     monkeypatch.setenv("LANGCODE_MODEL", "custom-model")
@@ -331,9 +334,11 @@ def test_load_project_context_creates_empty_hermes_memory_files(tmp_path: Path) 
 
     context = load_project_context(tmp_path)
 
-    assert context == ""
+    assert "SOUL.md" in context
+    assert "LangCode" in context
     assert (tmp_path / ".langcode" / "memories" / "MEMORY.md").is_file()
     assert (tmp_path / ".langcode" / "memories" / "USER.md").is_file()
+    assert (tmp_path / ".langcode" / "SOUL.md").is_file()
 
 
 def test_compact_messages_drops_orphan_tool_messages_and_preserves_tool_calls() -> None:

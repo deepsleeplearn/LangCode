@@ -26,8 +26,8 @@ class AsrSettings:
     partial_interval_sec: float = 1.4
     min_audio_sec: float = 1.0
     final_silence_ms: int = 900
-    audio_vad_silero_threshold: float = 0.50
-    audio_vad_energy_threshold: float = 0.014
+    audio_vad_silero_threshold: float = 0.55
+    audio_vad_energy_threshold: float = 0.025
     audio_vad_min_silence_ms: int = 800
     pre_speech_buffer_ms: int = 350
     max_utterance_sec: float = 30.0
@@ -46,8 +46,8 @@ class AsrSettings:
             partial_interval_sec=_float_env("LANGCODE_ASR_PARTIAL_INTERVAL_SEC", 1.4),
             min_audio_sec=_float_env("LANGCODE_ASR_MIN_AUDIO_SEC", 1.0),
             final_silence_ms=_int_env("LANGCODE_ASR_FINAL_SILENCE_MS", 900),
-            audio_vad_silero_threshold=_float_env("LANGCODE_AUDIO_VAD_SILERO_THRESHOLD", 0.50),
-            audio_vad_energy_threshold=_float_env("LANGCODE_AUDIO_VAD_ENERGY_THRESHOLD", 0.014),
+            audio_vad_silero_threshold=_float_env("LANGCODE_AUDIO_VAD_SILERO_THRESHOLD", 0.55),
+            audio_vad_energy_threshold=_float_env("LANGCODE_AUDIO_VAD_ENERGY_THRESHOLD", 0.025),
             audio_vad_min_silence_ms=_int_env("LANGCODE_AUDIO_VAD_MIN_SILENCE_MS", 800),
             pre_speech_buffer_ms=_int_env("LANGCODE_ASR_PRE_SPEECH_BUFFER_MS", 350),
             max_utterance_sec=_float_env("LANGCODE_ASR_MAX_UTTERANCE_SEC", 30.0),
