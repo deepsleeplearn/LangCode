@@ -3,6 +3,7 @@
   <img alt="LangGraph" src="https://img.shields.io/badge/Agent-LangGraph-1C3C3C">
   <img alt="Local-first" src="https://img.shields.io/badge/Local--first-Yes-2EA44F">
   <img alt="Human-in-the-loop" src="https://img.shields.io/badge/Approval-Human--in--the--loop-8A2BE2">
+  <a href="LICENSE"><img alt="License: MIT" src="https://img.shields.io/badge/License-MIT-blue.svg"></a>
 </p>
 
 # LangCode Agent
