@@ -45,11 +45,18 @@ def diagram_tool(workspace_root: str | Path, tool_input: dict) -> dict:
     if raw_mermaid:
         mermaid = _normalize_raw_mermaid(raw_mermaid)
     else:
+        structured_error = _validate_structured_input(tool_input)
+        if structured_error:
+            return {"ok": False, **structured_error}
         mermaid = _build_graph_mermaid(tool_input)
 
     validation_error = _validate_mermaid(mermaid)
     if validation_error:
         return {"ok": False, "error": validation_error}
+
+    structure_error = _validate_mermaid_structure(mermaid)
+    if structure_error:
+        return {"ok": False, **structure_error}
 
     return {
         "ok": True,
@@ -149,6 +156,156 @@ def _validate_mermaid(mermaid: str) -> str | None:
     for pattern, pattern_id in _DANGEROUS_MERMAID_PATTERNS:
         if re.search(pattern, mermaid, re.IGNORECASE):
             return f"Mermaid 内容包含不安全片段：{pattern_id}"
+    return None
+
+
+_STRUCTURE_CHECKED_PREFIXES = ("graph ", "flowchart ")
+_SKIPPED_LINE_KEYWORDS = (
+    "subgraph",
+    "end",
+    "direction",
+    "style",
+    "classdef",
+    "class",
+    "linkstyle",
+    "click",
+    "acctitle",
+    "accdescr",
+)
+# `A -->|yes| B`
+_PIPE_LABEL_RE = re.compile(r"\|[^|\n]*\|")
+# `A -- text --> B`, `A -. text .-> B`, `A == text ==> B`
+_TEXT_LINK_RE = re.compile(r"(?:-{2,}|={2,}|-\.+)\s*[^-=<>|\n]+?\s*(?:-{2,}|={2,}|\.-+)[->ox]?")
+# `A --> B`, `A --- B`, `A -.-> B`, `A ==> B`, `A --o B`, `A <--> B`
+_PLAIN_LINK_RE = re.compile(r"<?(?:-{2,}|={2,}|-\.+-*)[->ox]?")
+_LINK_SENTINEL = "\x00"
+_SHAPE = r"(?:\[\[.*\]\]|\(\(.*\)\)|\{\{.*\}\}|\[/.*[/\\]\]|>.*\]|\[.*\]|\(.*\)|\{.*\})"
+_NODE_RE = re.compile(rf"^(?P<id>[^\s\[\](){{}}<>|=&]+)\s*(?P<shape>{_SHAPE})?(?:\s*:::[\w-]+)?$", re.S)
+
+
+def _validate_structured_input(tool_input: dict) -> dict | None:
+    """Reject structured edges whose endpoints are not declared in ``nodes``.
+
+    Such edges used to be dropped silently, so the model got back a diagram
+    that quietly lost the relationship it asked for.
+    """
+
+    edges = _normalize_edges(tool_input.get("edges"))
+    if not edges:
+        return None
+    declared = {node["id"] for node in _normalize_nodes(tool_input.get("nodes"))}
+    missing = [
+        endpoint
+        for edge in edges
+        for endpoint in (edge["source"], edge["target"])
+        if endpoint not in declared
+    ]
+    if not missing:
+        return None
+    return {
+        "error": f"边引用了未在 nodes 中声明的节点：{', '.join(dict.fromkeys(missing))}",
+        "hint": "请在 nodes 中补齐这些节点（id 会被规范化为字母数字下划线），或修正 edges 的 source/target。",
+    }
+
+
+def _validate_mermaid_structure(mermaid: str) -> dict | None:
+    """Light structural checks for flowchart/graph Mermaid.
+
+    Only graph/flowchart is checked: it is what this tool generates, and its
+    statements are single-line, so per-line bracket balance is meaningful.
+    ``classDiagram``/``stateDiagram`` bodies legitimately span lines, so they
+    are left to the frontend renderer.
+    """
+
+    stripped = mermaid.lstrip()
+    if not any(stripped.startswith(prefix) for prefix in _STRUCTURE_CHECKED_PREFIXES):
+        return None
+
+    labels: dict[str, str] = {}
+    for number, raw_line in enumerate(stripped.splitlines()[1:], start=2):
+        line = raw_line.strip().rstrip(";").strip()
+        if not line or line.startswith("%%"):
+            continue
+
+        unbalanced = _unbalanced_reason(line)
+        if unbalanced:
+            return {
+                "error": f"第 {number} 行 Mermaid 语法不平衡：{unbalanced} —— {line}",
+                "hint": '每行的 []、()、{} 和双引号都必须成对；标签里若含有括号或引号，请改写为 A["f(x)"] 形式。',
+            }
+
+        first_word = line.split(None, 1)[0].lower()
+        if first_word in _SKIPPED_LINE_KEYWORDS:
+            continue
+
+        for part in _statement_parts(line):
+            match = _NODE_RE.match(part)
+            if match is None:
+                return {
+                    "error": f"第 {number} 行的连线端点不是合法节点：{part or '(空)'} —— {line}",
+                    "hint": "连线两端都必须是节点 id（可带 [标签] 等形状），例如 A[开始] --> B[结束]；不要让箭头悬空。",
+                }
+            conflict = _record_label(labels, match)
+            if conflict:
+                return {
+                    "error": f"第 {number} 行节点 {conflict[0]} 的标签与前面的声明冲突：{conflict[1]} / {conflict[2]}",
+                    "hint": "同一个节点 id 只声明一次标签，其余位置直接引用 id。",
+                }
+    return None
+
+
+def _statement_parts(line: str) -> list[str]:
+    """Split a flowchart statement into its node endpoints, links removed."""
+
+    without_links = _PIPE_LABEL_RE.sub(" ", line)
+    without_links = _TEXT_LINK_RE.sub(_LINK_SENTINEL, without_links)
+    without_links = _PLAIN_LINK_RE.sub(_LINK_SENTINEL, without_links)
+    parts: list[str] = []
+    for chunk in without_links.split(_LINK_SENTINEL):
+        chunk = chunk.strip()
+        # `A & B --> C` declares two endpoints; only split when the chunk has no
+        # label that could legitimately contain an ampersand.
+        if "&" in chunk and not any(char in chunk for char in '["({'):
+            parts.extend(piece.strip() for piece in chunk.split("&"))
+        else:
+            parts.append(chunk)
+    return parts
+
+
+def _unbalanced_reason(line: str) -> str | None:
+    pairs = {")": "(", "]": "[", "}": "{"}
+    stack: list[str] = []
+    in_quotes = False
+    for char in line:
+        if char == '"':
+            in_quotes = not in_quotes
+            continue
+        if in_quotes:
+            continue
+        if char in "([{":
+            stack.append(char)
+        elif char in pairs:
+            if not stack or stack.pop() != pairs[char]:
+                return f"多余的 {char}"
+    if in_quotes:
+        return "双引号未闭合"
+    if stack:
+        return f"未闭合的 {stack[-1]}"
+    return None
+
+
+def _record_label(labels: dict[str, str], match: re.Match[str]) -> tuple[str, str, str] | None:
+    shape = match.group("shape")
+    if not shape:
+        return None
+    label = shape.strip("[](){}></\\").strip().strip('"').strip()
+    if not label:
+        return None
+    node_id = match.group("id")
+    previous = labels.get(node_id)
+    if previous is not None and previous != label:
+        return (node_id, previous, label)
+    labels[node_id] = label
     return None
 
 

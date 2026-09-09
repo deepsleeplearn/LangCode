@@ -1,0 +1,106 @@
+# LangCode pinned resolution.
+#
+# Used by scripts/start_macos.sh for every install:
+#   pip install -e .            -c constraints.txt          # core
+#   pip install -e ".[voice]"   -c constraints.txt          # + speech stack
+#   pip install --no-deps       -c constraints.txt -r requirements-voice-nodeps.txt
+#   pip install --no-deps       -c constraints.txt mlx-audio-plus   # must be last
+#
+# Only packages with genuinely conflicting version ranges are pinned. Everything
+# else is left to pip so this file does not rot on every unrelated release.
+#
+# To refresh after a version bump:
+#   python3 -m venv /tmp/lc-pin && /tmp/lc-pin/bin/pip install -e ".[voice]"
+#   /tmp/lc-pin/bin/pip freeze   # copy the lines below from the output
+
+# --- core -------------------------------------------------------------------
+langchain==1.3.1
+langchain-core==1.4.0
+langchain-openai==1.2.1
+langchain-tavily==0.2.18
+langgraph==1.2.0
+langgraph-checkpoint-sqlite==3.1.0
+tiktoken==0.14.0
+sanic==25.12.1
+redis==8.1.0
+soundfile==0.14.0
+
+# numpy: numba (via librosa) caps it at <2.3, so core must not float up to the
+# 2.5.x pip would otherwise pick, or installing the voice extra downgrades it.
+numpy==2.2.6
+
+# huggingface_hub: transformers 4.57.6 requires <1.0. Without this pin core
+# resolves 1.30.0 and the voice install has to downgrade it (2 versions tried).
+huggingface_hub==0.36.2
+
+# --- voice ------------------------------------------------------------------
+transformers==4.57.6
+accelerate==1.12.0
+tokenizers==0.22.1
+safetensors==0.5.3
+torch==2.8.0
+torchaudio==2.8.0
+silero-vad==6.2.1
+onnxruntime==1.22.1
+kaldi-native-fbank==1.22.3
+scipy==1.16.0
+
+# librosa's numeric tail. numba<->numpy is the second-hardest constraint here.
+librosa==0.11.0
+numba==0.61.2
+llvmlite==0.44.0
+scikit-learn==1.7.0
+soxr==0.5.0.post1
+
+# nagisa is a hard top-level import of qwen_asr/__init__.py (via the forced
+# aligner), so it is required even though we never call the aligner.
+# dyNET38 2.2 only publishes a cp312 macOS/arm64 wheel - see README.
+nagisa==0.2.11
+dyNET38==2.2
+
+# Apple silicon
+mlx==0.31.2
+mlx-metal==0.31.2
+# einops: required by the mlx_audio codec modules on the cosyvoice3 load path.
+# 0.8.1 is what the known-good runtime environment has.
+einops==0.8.1
+miniaudio==1.71
+sounddevice==0.5.3
+sentencepiece==0.2.0
+protobuf==6.31.1
+
+# --- installed with --no-deps (see requirements-voice-nodeps.txt) ------------
+# Their declared metadata is mutually unsatisfiable; these are the versions the
+# known-good runtime environment actually has.
+qwen-asr==0.0.6
+mlx-audio==0.4.3
+mlx-lm==0.31.3
+
+# mlx-audio-plus is a published fork (github.com/DePasqualeOrg/mlx-audio-plus,
+# MIT) that installs INTO the `mlx_audio` package namespace. It is the only
+# source of the modules our TTS needs - no mlx-audio release from 0.4.3 through
+# 0.5.3 ships any of them:
+#   mlx_audio/tts/models/cosyvoice3    <- the Fun-CosyVoice3 model itself
+#   mlx_audio/tts/models/cosyvoice2
+#   mlx_audio/codec/models/s3gen       <- imported by voice/mlx_cosyvoice3.py
+#   mlx_audio/codec/models/s3tokenizer <- imported by voice/mlx_cosyvoice3.py
+# mlx_audio.tts.utils resolves a model by importing
+# `mlx_audio.tts.models.<model_type>` and offers no registry hook, so the module
+# has to exist on disk. Without this package the server logs
+# "Model type cosyvoice3 not supported for tts" and custom-voice TTS is dead.
+#
+# It declares transformers<5.0.0,>=4.49.0, which our pinned 4.57.6 satisfies.
+# It is still installed --no-deps because it also declares mlx-lm<0.30.0 (we run
+# 0.31.3, which works) and pulls mlx-audio[all] plus a large demo tail.
+#
+# ORDER MATTERS: it overwrites 250 files that mlx-audio 0.4.3 also owns, so it
+# must be installed AFTER mlx-audio. start_macos.sh does that in its own pip
+# step, which is why this package is not in requirements-voice-nodeps.txt.
+mlx-audio-plus==0.1.8
+
+# Not pinned, and not installed: gradio / gradio_client / flask / sox / pytz /
+# qwen-omni-utils / soynlp. They are qwen-asr metadata deps only; nothing on the
+# runtime import path reaches them. See pyproject.toml.
+#
+# accelerate is the exception and IS installed (pinned above): Qwen3ASRModel
+# loads weights with a device_map, which transformers refuses to do without it.

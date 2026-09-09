@@ -141,7 +141,9 @@ def test_graph_interrupts_before_read_workspace_escape_and_resumes_after_accept(
     resumed = agent.resume(thread_id, {"type": "accept"})
 
     assert resumed["tool_result"]["ok"] is True
-    assert resumed["tool_result"]["content"] == "outside content"
+    content = resumed["tool_result"]["content"]
+    assert content.startswith("1: outside content")
+    assert content.rstrip().endswith("[共 1 行，已显示 1-1 行]")
 
 
 def test_graph_rejects_workspace_escape_without_running_tool(tmp_path: Path) -> None:
@@ -246,3 +248,125 @@ def test_checkpoint_resume_rejects_workspace_mismatch(tmp_path: Path) -> None:
     assert "工作区不匹配" in resumed["tool_result"]["error"]
     assert not (root_a / "where.txt").exists()
     assert not (root_b / "where.txt").exists()
+
+
+def test_checkpoint_connection_uses_wal_and_busy_timeout(tmp_path: Path) -> None:
+    agent = CodeAgent(workspace_root=tmp_path, checkpoint_path=tmp_path / "cp.sqlite")
+    try:
+        connection = agent._checkpoint_connection
+        assert connection is not None
+        assert connection.execute("PRAGMA journal_mode").fetchone()[0].lower() == "wal"
+        assert connection.execute("PRAGMA busy_timeout").fetchone()[0] == 30000
+    finally:
+        agent.close()
+
+
+def test_prune_thread_keeps_newest_checkpoints_and_their_writes(tmp_path: Path) -> None:
+    (tmp_path / "a.txt").write_text("hello", encoding="utf-8")
+    agent = CodeAgent(workspace_root=tmp_path, checkpoint_path=tmp_path / "cp.sqlite")
+    try:
+        for _ in range(6):
+            agent.request_tool(ToolCall("read_file", {"path": "a.txt"}), thread_id="keep-me")
+        agent.request_tool(ToolCall("read_file", {"path": "a.txt"}), thread_id="other")
+
+        connection = agent._checkpoint_connection
+        before = connection.execute(
+            "SELECT COUNT(*) FROM checkpoints WHERE thread_id = 'keep-me'"
+        ).fetchone()[0]
+        other_before = connection.execute(
+            "SELECT COUNT(*) FROM checkpoints WHERE thread_id = 'other'"
+        ).fetchone()[0]
+        assert before > 3
+
+        removed = agent.prune_thread("keep-me", keep=3)
+
+        assert removed == before - 3
+        assert connection.execute(
+            "SELECT COUNT(*) FROM checkpoints WHERE thread_id = 'keep-me'"
+        ).fetchone()[0] == 3
+        assert connection.execute(
+            "SELECT COUNT(*) FROM writes w WHERE w.thread_id = 'keep-me' AND NOT EXISTS ("
+            "  SELECT 1 FROM checkpoints c WHERE c.thread_id = w.thread_id"
+            "  AND c.checkpoint_ns = w.checkpoint_ns AND c.checkpoint_id = w.checkpoint_id)"
+        ).fetchone()[0] == 0
+        assert connection.execute(
+            "SELECT COUNT(*) FROM checkpoints WHERE thread_id = 'other'"
+        ).fetchone()[0] == other_before
+
+        resumed = agent.request_tool(ToolCall("read_file", {"path": "a.txt"}), thread_id="keep-me")
+        assert resumed["tool_result"]["ok"] is True
+    finally:
+        agent.close()
+
+
+def test_prune_thread_reads_keep_count_from_env(tmp_path: Path, monkeypatch) -> None:
+    monkeypatch.setenv("LANGCODE_CHECKPOINT_KEEP", "2")
+    (tmp_path / "a.txt").write_text("hello", encoding="utf-8")
+    agent = CodeAgent(workspace_root=tmp_path, checkpoint_path=tmp_path / "cp.sqlite")
+    try:
+        for _ in range(4):
+            agent.request_tool(ToolCall("read_file", {"path": "a.txt"}), thread_id="env-keep")
+
+        agent.prune_thread("env-keep")
+
+        assert agent._checkpoint_connection.execute(
+            "SELECT COUNT(*) FROM checkpoints WHERE thread_id = 'env-keep'"
+        ).fetchone()[0] == 2
+    finally:
+        agent.close()
+
+
+def test_prune_thread_is_a_noop_for_the_in_memory_checkpointer(tmp_path: Path) -> None:
+    agent = CodeAgent(workspace_root=tmp_path)
+
+    assert agent.prune_thread("anything") == 0
+
+
+def test_prune_thread_serializes_on_the_checkpointer_lock(tmp_path: Path) -> None:
+    (tmp_path / "a.txt").write_text("hello", encoding="utf-8")
+    agent = CodeAgent(workspace_root=tmp_path, checkpoint_path=tmp_path / "cp.sqlite")
+    try:
+        assert agent._checkpoint_write_lock() is agent.checkpointer.lock
+
+        for _ in range(5):
+            agent.request_tool(ToolCall("read_file", {"path": "a.txt"}), thread_id="locked")
+
+        # The saver's lock is not reentrant: pruning must not already hold it.
+        assert agent.prune_thread("locked", keep=2) > 0
+    finally:
+        agent.close()
+
+
+def test_prune_thread_falls_back_to_its_own_lock(tmp_path: Path) -> None:
+    agent = CodeAgent(workspace_root=tmp_path, checkpoint_path=tmp_path / "cp.sqlite")
+    try:
+        agent.checkpointer = object()  # a saver without a `lock` attribute
+
+        assert agent._checkpoint_write_lock() is agent._checkpoint_lock
+    finally:
+        agent._checkpoint_connection.close()
+
+
+def test_prune_thread_also_clears_a_blob_table_when_one_exists(tmp_path: Path) -> None:
+    (tmp_path / "a.txt").write_text("hello", encoding="utf-8")
+    agent = CodeAgent(workspace_root=tmp_path, checkpoint_path=tmp_path / "cp.sqlite")
+    try:
+        connection = agent._checkpoint_connection
+        # langgraph-checkpoint-sqlite 2.0.10 has no blob table; simulate a
+        # newer layout to prove the extra DELETE is wired up.
+        connection.execute(
+            "CREATE TABLE blobs (thread_id TEXT, checkpoint_ns TEXT, checkpoint_id TEXT, blob BLOB)"
+        )
+        for _ in range(5):
+            agent.request_tool(ToolCall("read_file", {"path": "a.txt"}), thread_id="blobby")
+        rows = connection.execute(
+            "SELECT thread_id, checkpoint_ns, checkpoint_id FROM checkpoints WHERE thread_id = 'blobby'"
+        ).fetchall()
+        connection.executemany("INSERT INTO blobs VALUES (?, ?, ?, x'00')", rows)
+        connection.commit()
+
+        agent.prune_thread("blobby", keep=2)
+
+        assert connection.execute("SELECT COUNT(*) FROM blobs").fetchone()[0] == 2
+    finally:
+        agent.close()

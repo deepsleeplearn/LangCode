@@ -33,8 +33,17 @@ class ShellRisk:
 
 
 TASK_TOOLS = {"task_create", "task_update", "task_list", "task_get", "task_cancel"}
-MEMORY_TOOLS = {"memory", "soul", "self_evolve", "cron", "session_search", "skill", "diagram"}
-AUTO_ALLOWED_TOOLS = {"read_file", "search", "ls", "glob", "web_search", "web_fetch", *TASK_TOOLS, *MEMORY_TOOLS}
+AUTO_ALLOWED_TOOLS = {
+    "read_file",
+    "search",
+    "ls",
+    "glob",
+    "web_search",
+    "web_fetch",
+    "session_search",
+    "diagram",
+    *TASK_TOOLS,
+}
 APPROVAL_REQUIRED_TOOLS = {"write_file", "edit_file"}
 SHELL_TOOL_NAME = "shell"
 SANDBOX_SHELL_TOOL_NAME = "sandbox_shell"
@@ -68,6 +77,22 @@ _SHELL_NETWORK_OR_PRIVILEGE_COMMANDS = {
     "wget",
 }
 
+_SHELL_READ_ONLY_PIPE_COMMANDS = {
+    "cat",
+    "column",
+    "cut",
+    "grep",
+    "head",
+    "less",
+    "more",
+    "nl",
+    "sort",
+    "tail",
+    "tr",
+    "uniq",
+    "wc",
+}
+
 _SHELL_INTERPRETER_EVAL_COMMANDS = {
     "bash": {"-c"},
     "node": {"-e", "--eval"},
@@ -79,6 +104,53 @@ _SHELL_INTERPRETER_EVAL_COMMANDS = {
     "sh": {"-c"},
     "zsh": {"-c"},
 }
+
+# Interpreters whose short flags may be bundled (``perl -ne '...'``), so any
+# cluster containing ``e`` still evaluates inline code.
+_SHELL_CLUSTERED_EVAL_INTERPRETERS = {"perl", "ruby"}
+
+# Builtins that re-dispatch an arbitrary command string. Their argument is
+# never visible to the static workspace-escape checker, so they always ask.
+_SHELL_COMMAND_DISPATCH_COMMANDS = {
+    ".",
+    "builtin",
+    "command",
+    "eval",
+    "exec",
+    "source",
+}
+
+# Commands that print the process environment, i.e. every API key the agent
+# was started with. They ask with or without arguments.
+_SHELL_ENVIRONMENT_DUMP_COMMANDS = {
+    "declare",
+    "env",
+    "export",
+    "printenv",
+    "set",
+    "typeset",
+}
+
+# Credential stores / secret managers.
+_SHELL_CREDENTIAL_COMMANDS = {
+    "defaults",
+    "keychain",
+    "op",
+    "pass",
+    "security",
+    "ssh-add",
+}
+
+# ``awk`` dialects take their program as a positional argument, so the
+# interpreter-eval flag check never sees it.
+_SHELL_INLINE_PROGRAM_COMMANDS = {"awk", "gawk", "mawk", "nawk"}
+
+# An inline program touching the filesystem or spawning a process. The rule is
+# deliberately blunt: a program text without ``/``, ``(`` or a backtick cannot
+# open a path or shell out, so it stays allowed.
+_INLINE_PROGRAM_RISK_MARKERS = ("getline", "system(", "open(", "File.", "`", "/", "(")
+
+_FIND_ACTION_FLAGS = {"-exec", "-execdir", "-ok", "-okdir", "-delete", "-fprintf", "-fls"}
 
 _DEFAULT_SHELL_ASK_PATTERNS = [
     "git push*",
@@ -96,6 +168,8 @@ _DEFAULT_SHELL_ASK_PATTERNS = [
 def permission_for_tool(tool_call: ToolCall, *, workspace_root: str | Path | None = None) -> ApprovalMode:
     if tool_call.name in AUTO_ALLOWED_TOOLS:
         return ApprovalMode.ALLOW
+    if tool_call.name in {"memory", "soul", "self_evolve", "cron", "skill"}:
+        return _memory_tool_permission(tool_call)
     if tool_call.name in APPROVAL_REQUIRED_TOOLS:
         return ApprovalMode.ASK
     if tool_call.name == SHELL_TOOL_NAME:
@@ -103,6 +177,19 @@ def permission_for_tool(tool_call: ToolCall, *, workspace_root: str | Path | Non
     if tool_call.name == SANDBOX_SHELL_TOOL_NAME:
         return permission_for_sandbox_shell(str(tool_call.args.get("command", "")), workspace_root=workspace_root)
     return ApprovalMode.DENY
+
+
+def _memory_tool_permission(tool_call: ToolCall) -> ApprovalMode:
+    defaults = {"memory": "read", "soul": "read", "self_evolve": "status", "cron": "list", "skill": "list"}
+    action = str(tool_call.args.get("action") or defaults[tool_call.name]).strip().lower()
+    read_actions = {
+        "memory": {"read", "view", "list"},
+        "soul": {"read", "view", "list"},
+        "self_evolve": {"status", "list_reflections", "reflections", "list_proposals", "proposals", "read_soul", "soul"},
+        "cron": {"list", "status", "due", "run_due"},
+        "skill": {"list", "read", "get"},
+    }
+    return ApprovalMode.ALLOW if action in read_actions.get(tool_call.name, set()) else ApprovalMode.ASK
 
 
 def permission_for_shell(command: str, *, workspace_root: str | Path | None = None) -> ApprovalMode:
@@ -192,6 +279,38 @@ def remember_shell_permission(workspace_root: str | Path, command: str, mode: st
 
 
 def classify_shell_risk(command: str) -> ShellRisk:
+    """Classify a whole command line, chain segment by chain segment.
+
+    ``a && b``, ``a || b`` and ``a; b`` used to be dangerous purely because of
+    the operator, which made ``python3 -m pytest -q && echo done`` ask for
+    approval. Each segment is classified on its own instead: the command asks
+    when *any* segment is dangerous, and is allowed only when every segment is.
+    """
+
+    chains = [segment for segment in _scan_shell_syntax(command).chains if segment.strip()]
+    if len(chains) > 1:
+        for segment in chains:
+            risk = _classify_single_command(segment)
+            if risk.dangerous:
+                return risk
+        return ShellRisk(False, "No high-risk shell pattern detected")
+    return _classify_single_command(command)
+
+
+def _classify_single_command(command: str) -> ShellRisk:
+    scan = _scan_shell_syntax(command)
+    if scan.expansions:
+        return ShellRisk(True, f"Command uses shell control syntax: {scan.expansions[0]}")
+    blocking = [operator for operator in scan.operators if operator != "|"]
+    if blocking:
+        return ShellRisk(True, f"Command uses shell control syntax: {blocking[0]}")
+    if "|" in scan.operators and not _is_read_only_pipeline(scan.segments):
+        return ShellRisk(True, "Command uses shell control syntax: |")
+
+    # Downstream pipeline stages are read-only whitelisted commands; the risk of
+    # the pipeline is therefore the risk of its upstream command.
+    head_command = scan.segments[0] if scan.segments else command
+
     lowered = command.lower()
     dangerous_patterns = [
         "rm -rf",
@@ -211,7 +330,7 @@ def classify_shell_risk(command: str) -> ShellRisk:
             return ShellRisk(True, f"Command contains dangerous pattern: {pattern}")
 
     try:
-        parts = shlex.split(command)
+        parts = shlex.split(head_command)
     except ValueError as exc:
         return ShellRisk(True, f"Command cannot be parsed safely: {exc}")
 
@@ -220,15 +339,157 @@ def classify_shell_risk(command: str) -> ShellRisk:
     if _has_shell_redirection(parts):
         return ShellRisk(True, "Command uses shell redirection and may read or write files")
     if parts:
-        command_name = Path(parts[0]).name.lower()
+        command_name = Path(parts[0]).name.lower() or parts[0].lower()
+        if command_name in _SHELL_COMMAND_DISPATCH_COMMANDS:
+            return ShellRisk(True, f"Command re-dispatches an unchecked command string: {command_name}")
+        if command_name in _SHELL_ENVIRONMENT_DUMP_COMMANDS:
+            return ShellRisk(True, f"Command can dump environment secrets: {command_name}")
+        if command_name in _SHELL_CREDENTIAL_COMMANDS:
+            return ShellRisk(True, f"Command reads a credential store: {command_name}")
+        if command_name == "gpg" and any(arg.startswith("--export") for arg in parts[1:]):
+            return ShellRisk(True, "Command exports private key material: gpg --export")
         if _is_interpreter_eval(command_name, parts[1:]):
             return ShellRisk(True, f"Command evaluates inline code: {command_name}")
+        if command_name in _SHELL_INTERPRETER_EVAL_COMMANDS and not parts[1:]:
+            # A bare ``sh``/``python3`` opens an interactive interpreter whose
+            # input is never seen by any static check.
+            return ShellRisk(True, f"Command starts an interactive interpreter: {command_name}")
+        if _has_risky_inline_program(command_name, parts[1:]):
+            return ShellRisk(True, f"Command runs an inline program that can touch the filesystem: {command_name}")
+        if command_name == "find" and any(arg in _FIND_ACTION_FLAGS for arg in parts[1:]):
+            return ShellRisk(True, "Command runs an action for every matched file: find")
         if command_name in _SHELL_MUTATING_COMMANDS:
             return ShellRisk(True, f"Command may mutate files: {command_name}")
         if command_name in _SHELL_NETWORK_OR_PRIVILEGE_COMMANDS:
             return ShellRisk(True, f"Command may use network, credentials, or elevated privileges: {command_name}")
 
     return ShellRisk(False, "No high-risk shell pattern detected")
+
+
+@dataclass(frozen=True)
+class _ShellScan:
+    """Quote-aware view of a shell command's control syntax."""
+
+    operators: list[str]
+    expansions: list[str]
+    segments: list[str]
+    chains: list[str]
+
+
+def _scan_shell_syntax(command: str) -> _ShellScan:
+    """Find control operators that are *not* neutralized by quoting.
+
+    Operators inside quotes (``echo 'a -> b'``) are literal text and are not
+    reported. Parameter/command expansion (``$``, ``${``, ``$(``, backticks) is
+    reported unless it sits inside single quotes, because a double-quoted
+    ``"$HOME"`` is still expanded by the shell.
+
+    ``segments`` splits on ``|`` (pipeline stages); ``chains`` splits on ``&&``,
+    ``||`` and ``;`` (independently executed commands, each classified on its
+    own by :func:`classify_shell_risk`).
+    """
+
+    operators: list[str] = []
+    expansions: list[str] = []
+    segments: list[str] = []
+    chains: list[str] = []
+    current: list[str] = []
+    chain_current: list[str] = []
+    quote: str | None = None
+    index = 0
+    length = len(command)
+
+    def emit(text: str) -> None:
+        current.append(text)
+        chain_current.append(text)
+
+    while index < length:
+        char = command[index]
+        if quote == "'":
+            if char == "'":
+                quote = None
+            emit(char)
+            index += 1
+            continue
+        if char == "\\" and index + 1 < length:
+            emit(command[index : index + 2])
+            index += 2
+            continue
+        if char in "$`":
+            if command.startswith("${", index):
+                expansions.append("${")
+            elif command.startswith("$(", index):
+                expansions.append("$(")
+            else:
+                expansions.append(char)
+            emit(char)
+            index += 1
+            continue
+        if quote == '"':
+            if char == '"':
+                quote = None
+            emit(char)
+            index += 1
+            continue
+        if char in "'\"":
+            quote = char
+            emit(char)
+            index += 1
+            continue
+        if command.startswith("&&", index) or command.startswith("||", index):
+            operators.append(command[index : index + 2])
+            current.append(command[index : index + 2])
+            chains.append("".join(chain_current))
+            chain_current = []
+            index += 2
+            continue
+        if char == "|":
+            operators.append("|")
+            segments.append("".join(current))
+            current = []
+            chain_current.append("|")
+            index += 1
+            continue
+        if char == ";":
+            operators.append(char)
+            current.append(char)
+            chains.append("".join(chain_current))
+            chain_current = []
+            index += 1
+            continue
+        if char == "&":
+            operators.append(char)
+            emit(char)
+            index += 1
+            continue
+        if char == ">":
+            operators.append(">>" if command.startswith(">>", index) else ">")
+            emit(char)
+            index += 1
+            continue
+        emit(char)
+        index += 1
+
+    segments.append("".join(current))
+    chains.append("".join(chain_current))
+    return _ShellScan(operators=operators, expansions=expansions, segments=segments, chains=chains)
+
+
+def _is_read_only_pipeline(segments: list[str]) -> bool:
+    """True when every downstream stage of a pipeline is a read-only filter."""
+
+    if len(segments) < 2:
+        return False
+    for segment in segments[1:]:
+        try:
+            parts = shlex.split(segment)
+        except ValueError:
+            return False
+        if not parts:
+            return False
+        if Path(parts[0]).name.lower() not in _SHELL_READ_ONLY_PIPE_COMMANDS:
+            return False
+    return True
 
 
 def _rm_has_recursive_force_flags(args: list[str]) -> bool:
@@ -255,7 +516,37 @@ def _is_interpreter_eval(command_name: str, args: list[str]) -> bool:
     flags = _SHELL_INTERPRETER_EVAL_COMMANDS.get(command_name)
     if not flags:
         return False
-    return any(arg in flags for arg in args)
+    if any(arg in flags for arg in args):
+        return True
+    if command_name not in _SHELL_CLUSTERED_EVAL_INTERPRETERS:
+        return False
+    # ``perl -ne '...'`` / ``perl -lane '...'`` bundle the eval flag with others.
+    return any(
+        arg.startswith("-") and not arg.startswith("--") and "e" in arg[1:].lower() and arg[1:].isalpha()
+        for arg in args
+    )
+
+
+def _has_risky_inline_program(command_name: str, args: list[str]) -> bool:
+    """True when an ``awk``-style positional program can reach the filesystem."""
+
+    if command_name not in _SHELL_INLINE_PROGRAM_COMMANDS:
+        return False
+    skip_next = False
+    for arg in args:
+        if skip_next:
+            skip_next = False
+            continue
+        if arg in {"-f", "--file", "--source"}:
+            # The program lives in a file we cannot inspect statically.
+            return True
+        if arg in {"-v", "--assign", "-F", "--field-separator"}:
+            skip_next = True
+            continue
+        if arg.startswith("-") and arg != "-":
+            continue
+        return any(marker in arg for marker in _INLINE_PROGRAM_RISK_MARKERS)
+    return False
 
 
 def _matches_any_rule(command: str, rules: list[str]) -> bool:

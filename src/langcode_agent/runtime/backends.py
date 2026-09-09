@@ -17,12 +17,21 @@ class WorkspaceBackend:
     def __init__(self, workspace_root: str | Path) -> None:
         self.workspace_root = Path(workspace_root).expanduser().resolve()
 
-    def read_file(self, path: str, *, allow_workspace_escape: bool = False) -> dict:
+    def read_file(
+        self,
+        path: str,
+        *,
+        offset: int = 0,
+        limit: int = 2000,
+        allow_workspace_escape: bool = False,
+    ) -> dict:
         return {
             "ok": True,
-            "content": tools.read_file(
+            **tools._read_file_page(
                 self.workspace_root,
                 path,
+                offset=offset,
+                limit=limit,
                 allow_workspace_escape=allow_workspace_escape,
             ),
         }

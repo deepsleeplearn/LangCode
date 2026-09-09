@@ -1,5 +1,7 @@
+import os
 from pathlib import Path
 import sqlite3
+import threading
 from typing import Any, TypedDict
 from uuid import uuid4
 
@@ -13,6 +15,8 @@ from .permissions import ApprovalMode, ToolCall, classify_shell_risk, permission
 from ..tooling.tools import detect_workspace_escape, execute_tool
 
 patch_langchain_debug()
+
+DEFAULT_CHECKPOINT_KEEP = 20
 
 
 class AgentState(TypedDict, total=False):
@@ -32,6 +36,8 @@ class CodeAgent:
     ) -> None:
         self.workspace_root = Path(workspace_root).expanduser().resolve()
         self._checkpoint_connection: sqlite3.Connection | None = None
+        self._checkpoint_lock = threading.Lock()
+        self._checkpoint_blobs_table: str | None | bool = False  # False = not probed yet
         self.checkpointer = checkpointer or self._open_checkpointer(checkpoint_path)
         self.graph = self._build_graph()
 
@@ -214,7 +220,116 @@ class CodeAgent:
 
         path = Path(checkpoint_path).expanduser().resolve()
         path.parent.mkdir(parents=True, exist_ok=True)
-        self._checkpoint_connection = sqlite3.connect(path, check_same_thread=False)
-        saver = SqliteSaver(self._checkpoint_connection)
+        connection = sqlite3.connect(path, check_same_thread=False)
+        # WAL lets the CLI, the web server and the worker read while one writes;
+        # busy_timeout replaces the default instant "database is locked" failure.
+        connection.execute("PRAGMA journal_mode=WAL")
+        connection.execute("PRAGMA busy_timeout=30000")
+        self._checkpoint_connection = connection
+        saver = SqliteSaver(connection)
         saver.setup()
         return saver
+
+    def prune_thread(self, thread_id: str, *, keep: int | None = None) -> int:
+        """Keep only the newest ``keep`` checkpoints of one thread.
+
+        LangGraph writes a checkpoint per super-step, so a long-lived thread
+        grows without bound. ``checkpoint_id`` is a time-ordered UUID, so the
+        newest rows sort first under ``ORDER BY checkpoint_id DESC``; everything
+        older is deleted together with its ``writes`` rows. Returns the number of
+        checkpoints removed (0 for the in-memory checkpointer).
+
+        The connection is shared with ``SqliteSaver``, which serializes its own
+        writes on ``SqliteSaver.lock``. Pruning under a *different* lock let a
+        concurrent graph step interleave with these DELETEs on the same
+        connection, so we take the saver's lock whenever it exposes one.
+
+        langgraph-checkpoint-sqlite 2.0.10 (the installed version) stores only
+        ``checkpoints`` and ``writes``; newer layouts add a blob table, so
+        ``sqlite_master`` is probed once and its rows pruned too when present.
+        """
+
+        connection = self._checkpoint_connection
+        if connection is None or not thread_id:
+            return 0
+
+        keep_count = _checkpoint_keep(keep)
+        with self._checkpoint_write_lock():
+            try:
+                stale = connection.execute(
+                    "SELECT checkpoint_ns, checkpoint_id FROM checkpoints "
+                    "WHERE thread_id = ? ORDER BY checkpoint_id DESC",
+                    (thread_id,),
+                ).fetchall()[keep_count:]
+            except sqlite3.Error:
+                return 0
+            if not stale:
+                return 0
+            keys = [(thread_id, namespace, checkpoint_id) for namespace, checkpoint_id in stale]
+            blobs_table = self._blobs_table(connection)
+            try:
+                connection.executemany(
+                    "DELETE FROM writes WHERE thread_id = ? AND checkpoint_ns = ? AND checkpoint_id = ?",
+                    keys,
+                )
+                if blobs_table:
+                    connection.executemany(
+                        f"DELETE FROM {blobs_table} "  # noqa: S608 - name comes from sqlite_master, not user input
+                        "WHERE thread_id = ? AND checkpoint_ns = ? AND checkpoint_id = ?",
+                        keys,
+                    )
+                connection.executemany(
+                    "DELETE FROM checkpoints WHERE thread_id = ? AND checkpoint_ns = ? AND checkpoint_id = ?",
+                    keys,
+                )
+                connection.commit()
+            except sqlite3.Error:
+                connection.rollback()
+                return 0
+        return len(stale)
+
+    def _checkpoint_write_lock(self):
+        """The saver's own lock when it has one, so writes stay serialized."""
+
+        lock = getattr(self.checkpointer, "lock", None)
+        if lock is not None and hasattr(lock, "__enter__"):
+            return lock
+        return self._checkpoint_lock
+
+    def _blobs_table(self, connection: sqlite3.Connection) -> str | None:
+        """Name of a per-checkpoint blob table, probed once. ``None`` if absent."""
+
+        if self._checkpoint_blobs_table is not False:
+            return self._checkpoint_blobs_table  # type: ignore[return-value]
+        self._checkpoint_blobs_table = None
+        try:
+            names = {
+                str(row[0])
+                for row in connection.execute(
+                    "SELECT name FROM sqlite_master WHERE type = 'table' AND name IN ('blobs', 'checkpoint_blobs')"
+                ).fetchall()
+            }
+            for candidate in ("blobs", "checkpoint_blobs"):
+                if candidate not in names:
+                    continue
+                columns = {
+                    str(row[1]) for row in connection.execute(f"PRAGMA table_info({candidate})").fetchall()
+                }
+                if {"thread_id", "checkpoint_ns", "checkpoint_id"} <= columns:
+                    self._checkpoint_blobs_table = candidate
+                    break
+        except sqlite3.Error:
+            self._checkpoint_blobs_table = None
+        return self._checkpoint_blobs_table
+
+
+def _checkpoint_keep(keep: int | None = None) -> int:
+    if keep is not None:
+        try:
+            return max(1, int(keep))
+        except (TypeError, ValueError):
+            pass
+    try:
+        return max(1, int(os.getenv("LANGCODE_CHECKPOINT_KEEP", str(DEFAULT_CHECKPOINT_KEEP))))
+    except (TypeError, ValueError):
+        return DEFAULT_CHECKPOINT_KEEP

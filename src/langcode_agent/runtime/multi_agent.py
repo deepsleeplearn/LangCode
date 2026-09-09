@@ -1,6 +1,7 @@
 from __future__ import annotations
 
-from concurrent.futures import ThreadPoolExecutor, as_completed
+from concurrent.futures import ThreadPoolExecutor, TimeoutError as FuturesTimeoutError, as_completed
+import os
 from pathlib import Path
 from typing import Any, Callable
 from uuid import uuid4
@@ -114,6 +115,10 @@ def run_parallel_delegate_agents(
         return {"ok": False, "error": "至少需要提供一个子 Agent。"}
 
     runner = delegate_runner or run_delegate_agent
+    # Only forwarded when explicitly requested, so custom runners keep working
+    # with their existing signature; otherwise the sub-agent applies its own
+    # LANGCODE_SUBAGENT_MAX_ROUNDS default.
+    round_kwargs = {"max_rounds": max_rounds} if max_rounds is not None else {}
 
     def run_one(agent: dict) -> dict:
         result = runner(
@@ -121,6 +126,7 @@ def run_parallel_delegate_agents(
             role=agent["role"],
             task=agent["task"],
             context=agent.get("context", ""),
+            **round_kwargs,
         )
         return {
             "agent_id": agent["id"],
@@ -133,13 +139,29 @@ def run_parallel_delegate_agents(
 
     if parallel and len(normalized) > 1:
         messages: list[dict] = []
-        with ThreadPoolExecutor(max_workers=min(len(normalized), 4)) as executor:
+        executor = ThreadPoolExecutor(max_workers=min(len(normalized), 4))
+        try:
             future_to_index = {executor.submit(run_one, agent): index for index, agent in enumerate(normalized)}
             collected: dict[int, dict] = {}
-            for future in as_completed(future_to_index):
-                index = future_to_index[future]
-                collected[index] = future.result()
+            try:
+                completed = as_completed(
+                    future_to_index,
+                    timeout=max(1.0, float(os.getenv("LANGCODE_DELEGATE_TIMEOUT_SEC", "180"))),
+                )
+                for future in completed:
+                    index = future_to_index[future]
+                    try:
+                        collected[index] = future.result()
+                    except Exception as exc:
+                        collected[index] = _failed_delegate_message(normalized[index], exc)
+            except FuturesTimeoutError:
+                for future, index in future_to_index.items():
+                    if index not in collected:
+                        future.cancel()
+                        collected[index] = _failed_delegate_message(normalized[index], TimeoutError("子 Agent 执行超时"))
             messages = [collected[index] for index in sorted(collected)]
+        finally:
+            executor.shutdown(wait=False, cancel_futures=True)
     else:
         messages = [run_one(agent) for agent in normalized]
 
@@ -159,6 +181,18 @@ def run_parallel_delegate_agents(
     }
     _persist_dialogue(payload, _current_session_id, _session_store_path)
     return payload
+
+
+def _failed_delegate_message(agent: dict, error: Exception) -> dict:
+    result = {"ok": False, "error": f"{type(error).__name__}: {error}"}
+    return {
+        "agent_id": agent["id"],
+        "agent_name": agent["name"],
+        "role": "assistant",
+        "round": 1,
+        "content": result["error"],
+        "result": result,
+    }
 
 
 def run_agent_debate(

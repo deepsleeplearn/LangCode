@@ -3,6 +3,7 @@ from __future__ import annotations
 from dataclasses import dataclass, asdict
 from datetime import datetime, timezone
 import json
+import logging
 import os
 import re
 from pathlib import Path
@@ -16,6 +17,23 @@ from .project import memory_tool, skill_tool, soul_tool
 EVOLUTION_DIR = ".langcode/evolution"
 REFLECTIONS_FILE = "reflections.jsonl"
 PROPOSALS_DIR = "proposals"
+DEFAULT_MEMORY_AUTO_APPLY_THRESHOLD = 0.9
+_LOGGER = logging.getLogger(__name__)
+
+
+def _memory_auto_apply_enabled() -> bool:
+    """Whether high-confidence reflections may write memory without approval."""
+
+    raw = str(os.getenv("LANGCODE_MEMORY_AUTO_APPLY", "1")).strip().lower()
+    return raw in {"1", "true", "yes", "on", "y"}
+
+
+def _memory_auto_apply_threshold() -> float:
+    try:
+        value = float(os.getenv("LANGCODE_MEMORY_AUTO_APPLY_THRESHOLD", str(DEFAULT_MEMORY_AUTO_APPLY_THRESHOLD)))
+    except (TypeError, ValueError):
+        return DEFAULT_MEMORY_AUTO_APPLY_THRESHOLD
+    return min(1.0, max(0.0, value))
 
 
 @dataclass
@@ -113,11 +131,26 @@ def reflect_session(
         }
     applied: list[dict] = []
     staged: list[dict] = []
+    auto_apply_enabled = _memory_auto_apply_enabled()
+    threshold = _memory_auto_apply_threshold()
     for candidate in candidates:
-        should_apply = apply and candidate.apply and candidate.confidence >= 0.82
+        should_apply = (
+            apply
+            and auto_apply_enabled
+            and candidate.apply
+            and candidate.confidence >= threshold
+        )
         if should_apply:
             result = _apply_candidate(root, candidate)
             item = {**asdict(candidate), "result": result}
+            _LOGGER.info(
+                "自进化自动应用记忆候选：session=%s kind=%s target=%s confidence=%.2f ok=%s",
+                session_id,
+                candidate.kind,
+                candidate.target,
+                candidate.confidence,
+                result.get("ok") if isinstance(result, dict) else None,
+            )
             applied.append(item)
         else:
             staged.append(asdict(candidate))
@@ -227,7 +260,10 @@ def _build_candidates(messages: list[dict], todos: list[dict]) -> list[Evolution
                 name=name,
                 description=description,
                 content=content,
-                confidence=0.86 if auto_apply else 0.78,
+                # `auto_apply` is already an explicit opt-in gate
+                # (LANGCODE_AUTO_SKILL + >= 3 completed todos), so it clears the
+                # raised auto-apply bar; without that gate it stays a candidate.
+                confidence=0.9 if auto_apply else 0.78,
                 reason=(
                     "任务清单完成项达到自动沉淀阈值，写入项目 skill。"
                     if auto_apply

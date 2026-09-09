@@ -7,7 +7,7 @@ from typing import Any
 
 from langchain_core.messages import AIMessage, HumanMessage, SystemMessage, ToolMessage
 
-from ..core.context_management import make_json_safe
+from ..core.context_management import compact_tool_result, make_json_safe
 from .permissions import ApprovalMode, ToolCall, permission_for_tool
 from ..tooling.tools import execute_tool
 
@@ -25,6 +25,22 @@ WEB_SEARCH_LIMIT_MOCK_USER = (
     "直接回答我最初的问题；如果信息不足，也请说明依据和不确定性。"
 )
 WEB_SEARCH_LIMIT_ERROR = "外部网页搜索次数已达到上限。请基于已获得的搜索结果回答。"
+DEFAULT_SUBAGENT_MAX_ROUNDS = 8
+TOOL_ROUND_LIMIT_MOCK_USER = "已达工具调用轮次上限，请基于现有信息直接作答"
+
+
+def _subagent_max_rounds(max_rounds: int | None = None) -> int:
+    if max_rounds is not None:
+        try:
+            return max(1, int(max_rounds))
+        except (TypeError, ValueError):
+            pass
+    raw = os.getenv("LANGCODE_SUBAGENT_MAX_ROUNDS", str(DEFAULT_SUBAGENT_MAX_ROUNDS))
+    try:
+        value = int(raw)
+    except (TypeError, ValueError):
+        value = DEFAULT_SUBAGENT_MAX_ROUNDS
+    return max(1, value)
 
 
 def delegate_tool_schema() -> dict:
@@ -76,8 +92,10 @@ def run_delegate_agent(
     last_tool_result: dict | None = None
     web_search_count = 0
     rounds_used = 0
+    round_limit = _subagent_max_rounds(max_rounds)
+    session_id = f"delegate-{role}"
 
-    while True:
+    for _ in range(round_limit):
         web_search_limit_reached = False
         ai_message = bound_model.invoke(messages)
         rounds_used += 1
@@ -96,9 +114,12 @@ def run_delegate_agent(
             if tool_name == "web_search" and web_search_count >= _web_search_limit():
                 tool_result = _web_search_limit_result(tool_input, web_search_count)
                 messages.append(
-                    ToolMessage(
-                        content=json.dumps(make_json_safe(tool_result), ensure_ascii=False),
-                        tool_call_id=raw_tool_call.get("id") or tool_name,
+                    _tool_message(
+                        workspace_root,
+                        session_id,
+                        tool_name,
+                        tool_result,
+                        raw_tool_call.get("id") or tool_name,
                     )
                 )
                 web_search_limit_reached = True
@@ -124,21 +145,75 @@ def run_delegate_agent(
                 except Exception as exc:
                     tool_result = {"ok": False, "error": f"{type(exc).__name__}: {exc}"}
             last_tool_result = tool_result
-            if isinstance(tool_result, dict) and tool_result.get("ok") is False:
-                return {
-                    "ok": False,
-                    "role": role,
-                    "error": str(tool_result.get("error") or "子 Agent 工具调用失败。"),
-                    "last_tool_result": last_tool_result,
-                }
+            # A failing tool must still be answered with a ToolMessage, otherwise
+            # the transcript keeps an unpaired tool_call and the provider rejects
+            # the next request. The round bound above stops runaway retries.
             messages.append(
-                ToolMessage(
-                    content=json.dumps(make_json_safe(tool_result), ensure_ascii=False),
-                    tool_call_id=raw_tool_call.get("id") or tool_name,
+                _tool_message(
+                    workspace_root,
+                    session_id,
+                    tool_name,
+                    tool_result,
+                    raw_tool_call.get("id") or tool_name,
                 )
             )
         if web_search_limit_reached:
             messages.append(HumanMessage(content=WEB_SEARCH_LIMIT_MOCK_USER))
+
+    messages.append(HumanMessage(content=TOOL_ROUND_LIMIT_MOCK_USER))
+    final_message = bound_model.invoke(messages)
+    rounds_used += 1
+    summary = _message_text(final_message)
+    if not summary and isinstance(last_tool_result, dict) and last_tool_result.get("ok") is False:
+        return {
+            "ok": False,
+            "role": role,
+            "error": str(last_tool_result.get("error") or "子 Agent 工具调用失败。"),
+            "last_tool_result": last_tool_result,
+            "rounds": rounds_used,
+            "round_limit_reached": True,
+            "max_rounds": round_limit,
+        }
+    return {
+        "ok": True,
+        "role": role,
+        "summary": summary,
+        "rounds": rounds_used,
+        "round_limit_reached": True,
+        "max_rounds": round_limit,
+    }
+
+
+def _message_text(message: Any) -> str:
+    content = getattr(message, "content", "")
+    if isinstance(content, str):
+        return content.strip()
+    if isinstance(content, list):
+        parts = []
+        for item in content:
+            if isinstance(item, str):
+                parts.append(item)
+            elif isinstance(item, dict) and isinstance(item.get("text"), str):
+                parts.append(item["text"])
+        return "".join(parts).strip()
+    return str(content or "").strip()
+
+
+def _tool_message(
+    workspace_root: str | Path,
+    session_id: str,
+    tool_name: str,
+    tool_result: Any,
+    tool_call_id: str,
+) -> ToolMessage:
+    if isinstance(tool_result, dict):
+        payload = compact_tool_result(workspace_root, session_id, tool_name, tool_result)
+    else:
+        payload = make_json_safe(tool_result)
+    return ToolMessage(
+        content=json.dumps(payload, ensure_ascii=False),
+        tool_call_id=tool_call_id,
+    )
 
 
 def read_only_tool_schemas() -> list[dict]:

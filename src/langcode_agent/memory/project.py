@@ -33,6 +33,10 @@ DEFAULT_SOUL = (
 )
 _MEMORY_LOCK = threading.RLock()
 _SKILL_LOCK = threading.RLock()
+_CACHE_LOCK = threading.RLock()
+_PROJECT_CONTEXT_CACHE: dict[tuple[str, int], tuple[tuple, str]] = {}
+_SKILL_CATALOG_CACHE: dict[str, tuple[tuple, list[dict]]] = {}
+_ENSURED_MEMORY_ROOTS: set[str] = set()
 _INVISIBLE_CHARS = {"\u200b", "\u200c", "\u200d", "\u2060", "\ufeff", "\u202a", "\u202b", "\u202c", "\u202d", "\u202e"}
 _MEMORY_THREAT_PATTERNS = [
     (r"ignore\s+(previous|all|above|prior)\s+instructions", "prompt_injection"),
@@ -49,8 +53,28 @@ _MEMORY_THREAT_PATTERNS = [
 
 
 def load_project_context(workspace_root: str | Path, *, max_chars: int = DEFAULT_MEMORY_MAX_CHARS) -> str:
+    """Render the project system-context block, cached per workspace.
+
+    The block goes into every system prompt, so it is memoized and only rebuilt
+    when one of the contributing files (SOUL, memories, CLAUDE/AGENTS docs) or
+    the skills directories changes, keyed by mtime + size.
+    """
+
     root = Path(workspace_root).expanduser().resolve()
     ensure_hermes_memory_files(root)
+    cache_key = (str(root), int(max_chars))
+    fingerprint = _project_context_fingerprint(root)
+    with _CACHE_LOCK:
+        cached = _PROJECT_CONTEXT_CACHE.get(cache_key)
+        if cached is not None and cached[0] == fingerprint:
+            return cached[1]
+    rendered = _build_project_context(root, max_chars)
+    with _CACHE_LOCK:
+        _PROJECT_CONTEXT_CACHE[cache_key] = (fingerprint, rendered)
+    return rendered
+
+
+def _build_project_context(root: Path, max_chars: int) -> str:
     sections: list[str] = []
     remaining = max_chars
     soul = load_soul(root)
@@ -90,6 +114,18 @@ def load_project_context(workspace_root: str | Path, *, max_chars: int = DEFAULT
 
 def load_skill_catalog(workspace_root: str | Path) -> list[dict]:
     root = Path(workspace_root).expanduser().resolve()
+    fingerprint = _skill_catalog_fingerprint(root)
+    with _CACHE_LOCK:
+        cached = _SKILL_CATALOG_CACHE.get(str(root))
+        if cached is not None and cached[0] == fingerprint:
+            return [dict(item) for item in cached[1]]
+    items = _build_skill_catalog(root)
+    with _CACHE_LOCK:
+        _SKILL_CATALOG_CACHE[str(root)] = (fingerprint, items)
+    return [dict(item) for item in items]
+
+
+def _build_skill_catalog(root: Path) -> list[dict]:
     items: list[dict] = []
     seen: set[tuple[str, str]] = set()
     for scope, skills_root in _skill_roots(root):
@@ -487,7 +523,19 @@ def render_hermes_memory_snapshot(workspace_root: str | Path) -> str:
 
 
 def ensure_hermes_memory_files(workspace_root: str | Path) -> None:
+    """Create the Hermes memory scaffolding once per (workspace, process).
+
+    This runs on every system-prompt build; the mkdir/exists syscalls are pure
+    overhead after the first call, so the result is memoized. Writers still call
+    ``hermes_memory_path`` / ``hermes_soul_path``, which mkdir on their own.
+    """
+
     root = Path(workspace_root).expanduser().resolve()
+    key = str(root)
+    with _CACHE_LOCK:
+        if key in _ENSURED_MEMORY_ROOTS:
+            return
+
     soul_path = root / HERMES_SOUL_FILE
     soul_path.parent.mkdir(parents=True, exist_ok=True)
     if not soul_path.exists():
@@ -498,6 +546,53 @@ def ensure_hermes_memory_files(workspace_root: str | Path) -> None:
         path = memory_dir / filename
         if not path.exists():
             path.write_text("", encoding="utf-8")
+
+    with _CACHE_LOCK:
+        _ENSURED_MEMORY_ROOTS.add(key)
+
+
+def _stat_signature(path: Path) -> tuple[int, int]:
+    try:
+        stat = path.stat()
+    except OSError:
+        return (0, -1)
+    return (stat.st_mtime_ns, stat.st_size)
+
+
+def _project_context_fingerprint(root: Path) -> tuple:
+    parts: list = []
+    relatives = [
+        HERMES_SOUL_FILE,
+        *(f"{HERMES_MEMORY_DIR}/{filename}" for filename in HERMES_MEMORY_FILES.values()),
+        *PROJECT_CONTEXT_FILES,
+    ]
+    for relative in relatives:
+        parts.append((relative, _stat_signature(root / relative)))
+    parts.append(_skill_catalog_fingerprint(root))
+    return tuple(parts)
+
+
+def _skill_catalog_fingerprint(root: Path) -> tuple:
+    parts: list = []
+    for scope, skills_root in _skill_roots(root):
+        try:
+            with os.scandir(skills_root) as entries:
+                names = sorted(entry.name for entry in entries if entry.is_dir())
+        except OSError:
+            parts.append((scope, str(skills_root), None))
+            continue
+        signatures = tuple((name, _stat_signature(skills_root / name / "SKILL.md")) for name in names)
+        parts.append((scope, str(skills_root), signatures))
+    return tuple(parts)
+
+
+def reset_project_context_cache() -> None:
+    """Drop every memoized system-context artifact (used by tests)."""
+
+    with _CACHE_LOCK:
+        _PROJECT_CONTEXT_CACHE.clear()
+        _SKILL_CATALOG_CACHE.clear()
+        _ENSURED_MEMORY_ROOTS.clear()
 
 
 def compact_messages(

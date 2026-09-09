@@ -2,6 +2,8 @@ import concurrent.futures
 import json
 from pathlib import Path
 import sqlite3
+import time
+from uuid import uuid4
 
 from langchain_core.messages import AIMessage, AIMessageChunk, HumanMessage, SystemMessage, ToolMessage
 
@@ -35,6 +37,17 @@ def test_web_local_memory_command_does_not_require_api_key(tmp_path: Path, monke
     assert response["ok"] is True
     assert "已写入项目记忆" in response["messages"][0]["content"]
     assert "先跑快速测试" in (tmp_path / ".langcode" / "memories" / "MEMORY.md").read_text(encoding="utf-8")
+
+
+def test_refresh_session_skips_full_load_when_revision_is_unchanged(tmp_path: Path, monkeypatch) -> None:
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setenv("LANGCODE_ASR_PRELOAD", "0")
+    app = WebApp(tmp_path, tmp_path)
+    app.get_session("unchanged")
+
+    monkeypatch.setattr(app.store, "load_session", lambda _session_id: (_ for _ in ()).throw(AssertionError("full load")))
+
+    app.refresh_session_from_store("unchanged")
 
 
 def test_web_tts_preview_decodes_encoded_voice_id(tmp_path: Path, monkeypatch) -> None:
@@ -819,7 +832,13 @@ def test_web_chat_events_emits_tool_progress(tmp_path: Path, monkeypatch) -> Non
     assert progress_events[1]["status"] == "completed"
     assert progress_events[-1]["status"] == "summary"
     assert any(event["type"] == "delta" and event["content"] == "done" for event in events)
-    assert not any(event["type"] == "tool_result" for event in events)
+    # Item 22: successful tool results now emit a structured preview event too.
+    tool_results = [event for event in events if event["type"] == "tool_result"]
+    assert len(tool_results) == 1
+    assert tool_results[0]["toolName"] == "read_file"
+    assert tool_results[0]["ok"] is True
+    assert tool_results[0]["truncated"] is False
+    assert "hello" in tool_results[0]["preview"]
 
 
 def test_web_chat_events_emits_and_persists_diagram(tmp_path: Path, monkeypatch) -> None:
@@ -1682,3 +1701,1303 @@ def test_web_native_directory_picker_returns_selected_directory(tmp_path: Path, 
     assert response == {"ok": True, "cancelled": False, "path": str(selected)}
     assert captured["args"][-2:] == [str(tmp_path), "选择工作目录"]
     assert "item 2 of argv" in captured["args"][2]
+
+
+# ---------------------------------------------------------------------------
+# Round 2 backend regression tests
+# ---------------------------------------------------------------------------
+
+
+class _FakeRequest:
+    def __init__(self, *, path: str = "/api/status", headers=None, args=None, host: str = "127.0.0.1:8765"):
+        self.path = path
+        self.headers = dict(headers or {})
+        self.args = dict(args or {})
+        self.host = host
+
+
+def _build_static_frontend(root: Path) -> Path:
+    (root / "assets").mkdir(parents=True, exist_ok=True)
+    (root / "assets" / "index-abc123.js").write_text("export const x = 1;\n" * 400, encoding="utf-8")
+    (root / "index.html").write_text(
+        "<html><body data-token='__LANGCODE_TOKEN__'>" + ("padding " * 400) + "</body></html>",
+        encoding="utf-8",
+    )
+    return root
+
+
+def _static(app: WebApp, requested: str, request: _FakeRequest | None = None):
+    import asyncio as _asyncio
+
+    from langcode_agent.interfaces.web import _static_response
+
+    return _asyncio.run(_static_response(app, requested, request))
+
+
+def test_web_static_asset_sends_exactly_one_cache_control_header(tmp_path: Path) -> None:
+    frontend = _build_static_frontend(tmp_path / "dist")
+    app = WebApp(tmp_path, frontend, enable_voice=False)
+
+    asset = _static(app, "assets/index-abc123.js", _FakeRequest())
+    index = _static(app, "index.html", _FakeRequest())
+
+    assert asset.headers.getall("Cache-Control") == ["public, max-age=31536000, immutable"]
+    assert index.headers.getall("Cache-Control") == ["no-cache"]
+    assert asset.headers.get("ETag")
+    assert asset.headers.get("Vary") == "Accept-Encoding"
+
+
+def test_web_static_asset_returns_304_for_matching_etag(tmp_path: Path) -> None:
+    frontend = _build_static_frontend(tmp_path / "dist")
+    app = WebApp(tmp_path, frontend, enable_voice=False)
+    first = _static(app, "assets/index-abc123.js", _FakeRequest())
+    etag = first.headers.get("ETag")
+
+    cached = _static(app, "assets/index-abc123.js", _FakeRequest(headers={"if-none-match": etag}))
+
+    assert cached.status == 304
+    assert cached.headers.getall("Cache-Control") == ["public, max-age=31536000, immutable"]
+    assert not cached.body
+
+
+def test_web_static_asset_gzips_text_assets_when_accepted(tmp_path: Path) -> None:
+    import gzip as _gzip
+
+    frontend = _build_static_frontend(tmp_path / "dist")
+    app = WebApp(tmp_path, frontend, enable_voice=False)
+    raw = _static(app, "assets/index-abc123.js", _FakeRequest())
+
+    compressed = _static(
+        app,
+        "assets/index-abc123.js",
+        _FakeRequest(headers={"accept-encoding": "gzip, deflate, br"}),
+    )
+    # second hit must come from the (path, mtime, size) cache
+    again = _static(app, "assets/index-abc123.js", _FakeRequest(headers={"accept-encoding": "gzip"}))
+
+    assert compressed.headers.get("Content-Encoding") == "gzip"
+    assert compressed.headers.getall("Cache-Control") == ["public, max-age=31536000, immutable"]
+    assert len(compressed.body) < len(raw.body)
+    assert _gzip.decompress(compressed.body) == raw.body
+    assert again.body == compressed.body
+    assert raw.headers.get("Content-Encoding") is None
+
+
+def test_web_static_response_still_blocks_path_traversal(tmp_path: Path) -> None:
+    frontend = _build_static_frontend(tmp_path / "dist")
+    (tmp_path / "secret.txt").write_text("top secret", encoding="utf-8")
+    app = WebApp(tmp_path, frontend, enable_voice=False)
+
+    escaped = _static(app, "../secret.txt", _FakeRequest())
+
+    assert b"top secret" not in escaped.body
+    assert b"__LANGCODE_TOKEN__" not in escaped.body
+
+
+def test_web_refresh_session_reloads_when_store_revision_changed(tmp_path: Path, monkeypatch) -> None:
+    monkeypatch.chdir(tmp_path)
+    other_workspace = tmp_path / "other"
+    other_workspace.mkdir()
+    app = WebApp(tmp_path, tmp_path, enable_voice=False)
+    session = app.get_session("moved")
+    assert session.workspace_root == tmp_path.resolve()
+
+    app.store.ensure_session("moved", str(other_workspace.resolve()))
+    app.refresh_session_from_store("moved")
+
+    assert app.store.load_revision("moved") == 1
+    assert app.sessions["moved"].workspace_root == other_workspace.resolve()
+    assert app.sessions["moved"].revision == 1
+
+
+def _auth_middleware(app: WebApp):
+    """Build a throwaway Sanic app and return its auth middleware.
+
+    Sanic keeps a process-wide app registry keyed by name, so each test app
+    needs a unique name (and is unregistered afterwards) or the second call
+    raises ``Sanic app name "langcode-web" already in use``.
+    """
+    from sanic import Sanic
+
+    from langcode_agent.interfaces.web import create_sanic_app
+
+    name = f"langcode-web-test-{uuid4().hex}"
+    sanic_app = create_sanic_app(app, name=name)
+    try:
+        return list(sanic_app.request_middleware)[0].func
+    finally:
+        sanic_app.ctx.gen_pool.shutdown(wait=False, cancel_futures=True)
+        Sanic.unregister_app(sanic_app)
+
+
+def test_web_auth_middleware_rejects_non_ascii_token_without_crashing(tmp_path: Path) -> None:
+    import asyncio as _asyncio
+
+    app = WebApp(tmp_path, tmp_path, enable_voice=False)
+    middleware = _auth_middleware(app)
+
+    result = _asyncio.run(middleware(_FakeRequest(headers={"x-langcode-token": "令牌"})))
+
+    assert result is not None
+    assert result.status == 403
+
+
+def test_web_auth_middleware_accepts_query_token_only_for_asr_socket(tmp_path: Path) -> None:
+    import asyncio as _asyncio
+
+    app = WebApp(tmp_path, tmp_path, enable_voice=False)
+    middleware = _auth_middleware(app)
+
+    asr = _asyncio.run(middleware(_FakeRequest(path="/api/asr/stream", args={"token": app.api_token})))
+    other = _asyncio.run(middleware(_FakeRequest(path="/api/status", args={"token": app.api_token})))
+    header_ok = _asyncio.run(
+        middleware(_FakeRequest(path="/api/status", headers={"x-langcode-token": app.api_token}))
+    )
+
+    assert asr is None
+    assert other is not None and other.status == 403
+    assert header_ok is None
+
+
+class FakeUsageStreamingModel:
+    def stream(self, _messages):
+        yield AIMessageChunk(content="answer")
+        yield AIMessageChunk(
+            content="",
+            usage_metadata={"input_tokens": 11, "output_tokens": 7, "total_tokens": 18},
+        )
+
+
+class FakeAuthErrorStreamingModel:
+    def stream(self, _messages):
+        raise RuntimeError("Error code: 401 - invalid api key")
+        yield  # pragma: no cover
+
+
+class FakeSlowStreamingModel:
+    def stream(self, _messages):
+        import time as _time
+
+        yield AIMessageChunk(content="partial answer")
+        _time.sleep(0.05)
+        yield AIMessageChunk(content=" never shown")
+
+
+def test_web_stream_heartbeat_event_has_stable_shape() -> None:
+    from langcode_agent.interfaces.web import _stream_waiting_event
+
+    assert _stream_waiting_event(1) == {"type": "heartbeat", "waitedSec": 4}
+    assert _stream_waiting_event(3) == {"type": "heartbeat", "waitedSec": 12}
+
+
+def test_web_stream_error_event_is_classified_and_retriable_flagged(tmp_path: Path, monkeypatch) -> None:
+    monkeypatch.setenv("ZHIPU_API_KEY", "test-key")
+    app = WebApp(tmp_path, tmp_path, enable_voice=False)
+    session = app.get_session("error-code")
+    session.model = FakeAuthErrorStreamingModel()
+
+    events = list(app.chat_events({"sessionId": "error-code", "message": "hi"}))
+
+    error = events[-1]
+    assert error["type"] == "error"
+    assert error["ok"] is False
+    assert error["code"] == "auth"
+    assert error["retriable"] is False
+    assert "invalid api key" in error["error"]
+
+
+def test_web_stream_error_classifier_covers_documented_codes() -> None:
+    from langcode_agent.interfaces.web import _classify_stream_error
+
+    class RateLimitError(Exception):
+        pass
+
+    class APITimeoutError(Exception):
+        pass
+
+    class APIConnectionError(Exception):
+        pass
+
+    assert _classify_stream_error(RateLimitError("slow down")) == "rate_limit"
+    assert _classify_stream_error(APITimeoutError("boom")) == "model_timeout"
+    assert _classify_stream_error(APIConnectionError("boom")) == "network"
+    assert _classify_stream_error(ValueError("maximum context length is 8192")) == "context_overflow"
+    assert _classify_stream_error(ValueError("something odd")) == "internal"
+
+
+def test_web_error_event_marks_retriable_codes() -> None:
+    from langcode_agent.interfaces.web import _error_event
+
+    assert _error_event("x", "rate_limit")["retriable"] is True
+    assert _error_event("x", "model_timeout")["retriable"] is True
+    assert _error_event("x", "network")["retriable"] is True
+    assert _error_event("x", "internal")["retriable"] is False
+    assert _error_event("x", "auth")["retriable"] is False
+
+
+def test_web_notice_event_shape() -> None:
+    from langcode_agent.interfaces.web import _notice_event
+
+    assert _notice_event("context_compaction", "已压缩上下文") == {
+        "type": "notice",
+        "kind": "context_compaction",
+        "message": "已压缩上下文",
+    }
+
+
+def test_web_tool_success_event_truncates_long_previews() -> None:
+    from langcode_agent.interfaces.web import _tool_success_event
+
+    short = _tool_success_event("read_file", {"ok": True, "content": "hello"})
+    long = _tool_success_event("read_file", {"ok": True, "content": "x" * 5000})
+    internal = _tool_success_event("task_create", {"ok": True, "content": "hidden"})
+    failed = _tool_success_event("read_file", {"ok": False, "error": "nope"})
+
+    assert short == {
+        "type": "tool_result",
+        "toolName": "read_file",
+        "ok": True,
+        "preview": "hello",
+        "truncated": False,
+    }
+    assert long["truncated"] is True
+    assert len(long["preview"]) == 2000
+    assert internal is None
+    assert failed is None
+
+
+def test_web_failed_tool_result_event_shape_is_unchanged() -> None:
+    event = _tool_result_event("read_file", {"ok": False, "error": "missing"})
+
+    assert event["role"] == "tool"
+    assert event["kind"] == "tool_result"
+    assert event["toolName"] == "read_file"
+    assert "missing" in event["content"]
+
+
+def test_web_chat_events_emits_usage_event_from_final_chunk(tmp_path: Path, monkeypatch) -> None:
+    monkeypatch.setenv("ZHIPU_API_KEY", "test-key")
+    app = WebApp(tmp_path, tmp_path, enable_voice=False)
+    session = app.get_session("usage")
+    session.model = FakeUsageStreamingModel()
+
+    events = list(app.chat_events({"sessionId": "usage", "message": "hi"}))
+
+    usage = [event for event in events if event["type"] == "usage"]
+    assert usage == [{"type": "usage", "inputTokens": 11, "outputTokens": 7, "totalTokens": 18}]
+
+
+def test_web_chat_events_aborts_on_stream_idle_timeout(tmp_path: Path, monkeypatch) -> None:
+    monkeypatch.setenv("ZHIPU_API_KEY", "test-key")
+    monkeypatch.setenv("LANGCODE_STREAM_IDLE_TIMEOUT_SEC", "0.01")
+    app = WebApp(tmp_path, tmp_path, enable_voice=False)
+    session = app.get_session("idle")
+    session.model = FakeSlowStreamingModel()
+
+    events = list(app.chat_events({"sessionId": "idle", "message": "hi"}))
+
+    error = events[-1]
+    assert error["type"] == "error"
+    assert error["code"] == "model_timeout"
+    assert error["retriable"] is True
+    contents = [message["content"] for message in app.session_view("idle")["messages"]]
+    assert contents == ["hi", "partial answer"]
+
+
+def test_web_answers_unanswered_tool_calls_on_cancel(tmp_path: Path) -> None:
+    from langcode_agent.interfaces.web import _answer_unanswered_tool_calls
+
+    app = WebApp(tmp_path, tmp_path, enable_voice=False)
+    session = app.get_session("dangling")
+    ai_message = AIMessage(
+        content="",
+        tool_calls=[
+            {"name": "shell", "args": {}, "id": "call-1"},
+            {"name": "read_file", "args": {}, "id": "call-2"},
+        ],
+    )
+    session.messages = [HumanMessage(content="go"), ai_message]
+    session.display_messages = [HumanMessage(content="go"), ai_message]
+    session.messages.append(ToolMessage(content="{}", tool_call_id="call-1"))
+    session.display_messages.append(ToolMessage(content="{}", tool_call_id="call-1"))
+
+    added = _answer_unanswered_tool_calls(session)
+
+    assert added == 2  # one per message list
+    assert [message.tool_call_id for message in session.messages if isinstance(message, ToolMessage)] == [
+        "call-1",
+        "call-2",
+    ]
+    assert json.loads(session.messages[-1].content) == {"ok": False, "cancelled": True}
+
+
+def test_web_truncates_cancelled_partial_to_displayed_prefix() -> None:
+    from langcode_agent.interfaces.web import _truncate_partial_to_displayed
+
+    assert _truncate_partial_to_displayed("你好世界继续说了很多", "你好世界") == "你好世界（此处被用户打断）"
+    assert _truncate_partial_to_displayed("你好世界", "你好世界") == "你好世界"
+    assert _truncate_partial_to_displayed("你好世界", "不是前缀") == "你好世界"
+    assert _truncate_partial_to_displayed("你好世界", "") == "你好世界"
+
+
+def test_web_cancel_run_records_displayed_text_and_truncates_partial(tmp_path: Path, monkeypatch) -> None:
+    monkeypatch.setenv("ZHIPU_API_KEY", "test-key")
+    app = WebApp(tmp_path, tmp_path, enable_voice=False)
+    session = app.get_session("barge-in")
+    session.model = FakeTwoChunkStreamingModel()
+    events = app.chat_events({"sessionId": "barge-in", "message": "speak", "runId": "run-barge"})
+
+    assert next(events) == {"type": "delta", "content": "partial"}
+    app.cancel_run({"sessionId": "barge-in", "runId": "run-barge", "assistantDisplayedText": "par"})
+
+    assert list(events) == [{"type": "done", "ok": False, "cancelled": True}]
+    contents = [message["content"] for message in app.session_view("barge-in")["messages"]]
+    assert contents == ["speak", "par（此处被用户打断）"]
+
+
+def test_web_voice_interrupt_truncates_previous_partial_answer(tmp_path: Path, monkeypatch) -> None:
+    monkeypatch.setenv("ZHIPU_API_KEY", "test-key")
+    app = WebApp(tmp_path, tmp_path, enable_voice=False)
+    session = app.get_session("voice-trim")
+    session.model = FakeStreamingModel()
+    session.messages = [HumanMessage(content="讲个故事"), AIMessage(content="从前有座山山上有座庙")]
+    session.display_messages = list(session.messages)
+
+    list(
+        app.chat_events(
+            {
+                "sessionId": "voice-trim",
+                "message": "停",
+                "voiceInterrupt": {"spokenText": "停", "assistantDisplayedText": "从前有座山"},
+            }
+        )
+    )
+
+    assert session.display_messages[1].content == "从前有座山（此处被用户打断）"
+
+
+def test_web_session_history_pagination_defaults_to_full_history(tmp_path: Path) -> None:
+    app = WebApp(tmp_path, tmp_path, enable_voice=False)
+    session = app.get_session("paged")
+    session.messages = [HumanMessage(content=f"m{index}") for index in range(10)]
+    session.display_messages = list(session.messages)
+
+    full = app.session_view("paged")
+    last_three = app.session_view("paged", None, 3)
+    window = app.session_view("paged", 5, 2)
+
+    assert [message["content"] for message in full["messages"]] == [f"m{index}" for index in range(10)]
+    assert full["hasMore"] is False
+    assert full["total"] == 10
+    assert [message["content"] for message in last_three["messages"]] == ["m7", "m8", "m9"]
+    assert last_three["hasMore"] is True
+    assert [message["content"] for message in window["messages"]] == ["m3", "m4"]
+    assert window["firstIndex"] == 3
+    assert app.session_view("paged")["title"] == "paged"
+
+
+def test_web_limits_tool_rounds_and_forces_a_final_answer(tmp_path: Path, monkeypatch) -> None:
+    monkeypatch.setenv("ZHIPU_API_KEY", "test-key")
+    monkeypatch.setenv("LANGCODE_MAX_TOOL_ROUNDS", "2")
+    (tmp_path / "README.md").write_text("hello", encoding="utf-8")
+    app = WebApp(tmp_path, tmp_path, enable_voice=False)
+    session = app.get_session("rounds")
+
+    class FakeLoopingToolModel:
+        def __init__(self) -> None:
+            self.calls = 0
+
+        def stream(self, _messages):
+            self.calls += 1
+            if self.calls > 5:
+                yield AIMessageChunk(content="final answer")
+                return
+            yield AIMessageChunk(
+                content="",
+                tool_calls=[{"name": "read_file", "args": {"path": "README.md"}, "id": f"c{self.calls}"}],
+            )
+
+    model = FakeLoopingToolModel()
+    session.model = model
+
+    events = list(app.chat_events({"sessionId": "rounds", "message": "loop"}))
+
+    notices = [event for event in events if event["type"] == "notice"]
+    assert notices and notices[0]["kind"] == "tool_round_limit"
+    assert model.calls <= 4
+    assert events[-1] == {"type": "done", "ok": True}
+    from langcode_agent.interfaces.web import TOOL_ROUND_LIMIT_MOCK_USER
+
+    assert any(
+        isinstance(message, HumanMessage) and message.content == TOOL_ROUND_LIMIT_MOCK_USER
+        for message in session.messages
+    )
+
+
+def test_web_evicts_least_recently_used_sessions(tmp_path: Path, monkeypatch) -> None:
+    monkeypatch.setenv("LANGCODE_MAX_RESIDENT_SESSIONS", "2")
+    app = WebApp(tmp_path, tmp_path, enable_voice=False)
+
+    app.get_session("s1")
+    app.get_session("s2")
+    app.get_session("s1")  # refresh s1 so s2 becomes the oldest
+    app.get_session("s3")
+
+    assert set(app.sessions) == {"s1", "s3"}
+
+
+def test_web_never_evicts_a_running_session(tmp_path: Path, monkeypatch) -> None:
+    monkeypatch.setenv("LANGCODE_MAX_RESIDENT_SESSIONS", "1")
+    app = WebApp(tmp_path, tmp_path, enable_voice=False)
+    app.get_session("running")
+    app.runtime_state.mark_run_started("running", "run-x")
+
+    app.get_session("newcomer")
+
+    assert set(app.sessions) == {"running", "newcomer"}
+
+
+def test_web_self_evolve_tool_input_no_longer_carries_full_history(tmp_path: Path) -> None:
+    from langcode_agent.interfaces.web import _prepare_tool_input
+
+    app = WebApp(tmp_path, tmp_path, enable_voice=False)
+    session = app.get_session("evolve")
+    session.messages = [HumanMessage(content="secret history")]
+
+    prepared = _prepare_tool_input("self_evolve", {"action": "reflect"}, session)
+
+    assert "messages" not in prepared
+    assert prepared["session_id"] == "evolve"
+    assert prepared["_current_session_id"] == "evolve"
+
+
+def test_web_disabling_voice_skips_local_voice_services(tmp_path: Path, monkeypatch) -> None:
+    monkeypatch.delenv("LANGCODE_VOICE_WORKER_URL", raising=False)
+
+    app = WebApp(tmp_path, tmp_path, enable_voice=False)
+
+    assert app.enable_voice is False
+    assert app.asr is None
+    assert app.tts is None
+    assert app.turnsense is None
+    assert app.voice_worker is None
+    assert app.asr_status()["ok"] is False
+
+
+def test_web_partial_save_future_is_dropped_when_stream_ends(tmp_path: Path, monkeypatch) -> None:
+    monkeypatch.setenv("ZHIPU_API_KEY", "test-key")
+    app = WebApp(tmp_path, tmp_path, enable_voice=False)
+    session = app.get_session("leak")
+    session.model = FakeInterruptedStreamingModel()
+
+    events = app.chat_events({"sessionId": "leak", "message": "hi"})
+    next(events)
+    events.close()
+
+    assert app._partial_save_futures == {}
+
+
+class FakeStallingThenClosingStreamingModel:
+    """Emits one chunk, then stalls and simply ends without another chunk."""
+
+    def stream(self, _messages):
+        import time as _time
+
+        yield AIMessageChunk(content="partial answer")
+        _time.sleep(0.6)
+
+
+def test_web_stream_idle_watchdog_fires_while_iterator_is_blocked() -> None:
+    from langcode_agent.interfaces.web import _StreamIdleWatchdog
+
+    watchdog = _StreamIdleWatchdog(0.05, "wd")
+    watchdog.start()
+    assert watchdog.timed_out is False
+    deadline = time.monotonic() + 5.0
+    while not watchdog.timed_out and time.monotonic() < deadline:
+        time.sleep(0.01)
+    assert watchdog.timed_out is True
+    watchdog.cancel()
+
+    # A beat before the deadline rearms the timer instead of firing.
+    alive = _StreamIdleWatchdog(1.0, "wd2")
+    alive.start()
+    for _ in range(4):
+        time.sleep(0.02)
+        alive.beat()
+    assert alive.timed_out is False
+    # cancelling stops the timer for good
+    alive.cancel()
+    time.sleep(0.05)
+    assert alive.timed_out is False
+
+    # A zero/negative timeout disables the watchdog entirely.
+    disabled = _StreamIdleWatchdog(0.0, "wd3")
+    disabled.start()
+    time.sleep(0.05)
+    assert disabled.timed_out is False
+    disabled.cancel()
+
+
+def test_web_chat_events_times_out_when_stream_stalls_without_further_chunks(
+    tmp_path: Path, monkeypatch
+) -> None:
+    """Item 24: the stall must be caught even though no later chunk arrives."""
+    monkeypatch.setenv("ZHIPU_API_KEY", "test-key")
+    monkeypatch.setenv("LANGCODE_STREAM_IDLE_TIMEOUT_SEC", "0.05")
+    monkeypatch.setenv("LANGCODE_AUTO_REFLECT", "0")
+    app = WebApp(tmp_path, tmp_path, enable_voice=False)
+    session = app.get_session("stall")
+    session.model = FakeStallingThenClosingStreamingModel()
+
+    events = list(app.chat_events({"sessionId": "stall", "message": "hi"}))
+
+    error = events[-1]
+    assert error["type"] == "error"
+    assert error["code"] == "model_timeout"
+    assert error["retriable"] is True
+    contents = [message["content"] for message in app.session_view("stall")["messages"]]
+    assert contents == ["hi", "partial answer"]
+
+
+def test_web_state_json_stores_no_duplicate_display_message_copy(tmp_path: Path, monkeypatch) -> None:
+    """Item 6.4: no second full history copy when display == model history."""
+    monkeypatch.setenv("ZHIPU_API_KEY", "test-key")
+    app = WebApp(tmp_path, tmp_path, enable_voice=False)
+    session = app.get_session("nodup")
+    session.model = FakeStreamingModel()
+
+    list(app.chat_events({"sessionId": "nodup", "message": "问题"}))
+
+    stored = app.store.load_session("nodup")
+    state = stored["state"]
+    assert state["display_same_as_messages"] is True
+    assert "display_messages" not in state
+
+    app.sessions.pop("nodup")
+    reloaded = app.get_session("nodup")
+    assert [message.content for message in reloaded.display_messages] == ["问题", "hello"]
+    # the model history keeps the system prompt the displayed history never shows
+    assert isinstance(reloaded.messages[0], SystemMessage)
+    assert [message.content for message in reloaded.messages[1:]] == ["问题", "hello"]
+
+
+def test_web_state_json_keeps_display_copy_when_it_diverges(tmp_path: Path, monkeypatch) -> None:
+    """Item 12: a diverged display history goes to an artifact file, not state_json."""
+    from langcode_agent.interfaces.web import _display_archive_dir, _display_archive_name
+
+    monkeypatch.setenv("ZHIPU_API_KEY", "test-key")
+    app = WebApp(tmp_path, tmp_path, enable_voice=False)
+    session = app.get_session("compacted")
+    session.messages = [HumanMessage(content="summary of earlier turns")]
+    session.display_messages = [
+        HumanMessage(content="original question"),
+        AIMessage(content="original answer"),
+        HumanMessage(content="summary of earlier turns"),
+    ]
+
+    app._save_history(session)
+
+    state = app.store.load_session("compacted")["state"]
+    assert "display_same_as_messages" not in state
+    assert "display_messages" not in state
+    assert state["display_archive"] == _display_archive_name("compacted")
+    assert len(state["display_messages_tail"]) == 3
+    archive = _display_archive_dir(tmp_path) / state["display_archive"]
+    assert len(json.loads(archive.read_text(encoding="utf-8"))["messages"]) == 3
+
+    app.sessions.pop("compacted")
+    reloaded = app.get_session("compacted")
+    assert [message.content for message in reloaded.messages] == ["summary of earlier turns"]
+    assert [message.content for message in reloaded.display_messages] == [
+        "original question",
+        "original answer",
+        "summary of earlier turns",
+    ]
+
+
+class FakeDelegateStreamingModel:
+    def __init__(self) -> None:
+        self.calls = 0
+
+    def stream(self, _messages):
+        self.calls += 1
+        if self.calls == 1:
+            yield AIMessageChunk(
+                content="",
+                tool_calls=[
+                    {
+                        "name": "delegate_agents",
+                        "args": {"tasks": [{"prompt": "review"}]},
+                        "id": "delegate-call-1",
+                    }
+                ],
+            )
+            return
+        yield AIMessageChunk(content="汇总完成")
+
+
+def test_web_delegate_agents_result_is_compacted_into_the_tool_message(
+    tmp_path: Path, monkeypatch
+) -> None:
+    """Item 40: a huge delegate_agents payload must not land in the history."""
+    monkeypatch.setenv("ZHIPU_API_KEY", "test-key")
+    from langcode_agent.interfaces import web as web_module
+
+    monkeypatch.setenv("LANGCODE_AUTO_REFLECT", "0")
+    huge = {"ok": True, "results": [{"agent": f"a{i}", "output": "x" * 2000} for i in range(30)]}
+    monkeypatch.setattr(web_module, "run_parallel_delegate_agents", lambda _root, **_kwargs: huge)
+
+    app = WebApp(tmp_path, tmp_path, enable_voice=False)
+    session = app.get_session("delegate")
+    session.model = FakeDelegateStreamingModel()
+
+    list(app.chat_events({"sessionId": "delegate", "message": "并行委派"}))
+
+    tool_messages = [message for message in session.messages if isinstance(message, ToolMessage)]
+    assert len(tool_messages) == 1
+    payload = json.loads(tool_messages[0].content)
+    assert payload["offloaded"] is True
+    assert payload["summary"]
+    assert payload["artifact"]
+    # only a head/tail preview reaches the history; the payload lives in the artifact
+    raw_len = len(json.dumps(huge, ensure_ascii=False))
+    assert raw_len > 60000
+    assert len(tool_messages[0].content) < raw_len // 5
+    artifact_dir = tmp_path / ".langcode" / "artifacts" / "delegate"
+    assert artifact_dir.exists()
+    assert json.loads((tmp_path / payload["artifact"]).read_text(encoding="utf-8")) == huge
+
+
+def test_worker_concurrency_reads_env_with_safe_fallbacks(monkeypatch) -> None:
+    """Item 25: the queue worker dispatch pool size is configurable."""
+    from langcode_agent.interfaces.worker import DEFAULT_WORKER_CONCURRENCY, worker_concurrency
+
+    monkeypatch.delenv("LANGCODE_WORKER_CONCURRENCY", raising=False)
+    assert worker_concurrency() == DEFAULT_WORKER_CONCURRENCY
+
+    monkeypatch.setenv("LANGCODE_WORKER_CONCURRENCY", "9")
+    assert worker_concurrency() == 9
+
+    monkeypatch.setenv("LANGCODE_WORKER_CONCURRENCY", "0")
+    assert worker_concurrency() == 1
+
+    monkeypatch.setenv("LANGCODE_WORKER_CONCURRENCY", "not-a-number")
+    assert worker_concurrency() == DEFAULT_WORKER_CONCURRENCY
+
+
+def test_stream_queue_job_emits_heartbeats_without_unbound_counter(tmp_path: Path, monkeypatch) -> None:
+    """Regression: the heartbeat counter must be initialized before the loop."""
+    import asyncio as _asyncio
+
+    from langcode_agent.interfaces import web as web_module
+
+    app = WebApp(tmp_path, tmp_path, enable_voice=False)
+    monkeypatch.setattr(app.job_queue, "enqueue", lambda _kind, _payload: "job-1")
+
+    async def fake_events(_web_app, _job_id):
+        yield {"type": "queued"}
+        yield None
+        yield None
+        yield {"type": "delta", "content": "hi"}
+        yield None
+        yield {"type": "done", "ok": True}
+
+    monkeypatch.setattr(web_module, "_iter_queue_events", fake_events)
+
+    class FakeStreamingResponse:
+        def __init__(self) -> None:
+            self.chunks: list[dict] = []
+
+        async def write(self, data: bytes) -> None:
+            self.chunks.append(json.loads(data.decode("utf-8")))
+
+    written = FakeStreamingResponse()
+    _asyncio.run(
+        web_module._stream_queue_job(app, written, "chat_stream", {"sessionId": "q"}, heartbeat=True)
+    )
+
+    assert written.chunks == [
+        {"type": "heartbeat", "waitedSec": 4},
+        {"type": "heartbeat", "waitedSec": 8},
+        {"type": "delta", "content": "hi"},
+        {"type": "heartbeat", "waitedSec": 4},
+        {"type": "done", "ok": True},
+    ]
+
+
+def test_stream_queue_job_skips_heartbeats_when_disabled(tmp_path: Path, monkeypatch) -> None:
+    import asyncio as _asyncio
+
+    from langcode_agent.interfaces import web as web_module
+
+    app = WebApp(tmp_path, tmp_path, enable_voice=False)
+    monkeypatch.setattr(app.job_queue, "enqueue", lambda _kind, _payload: "job-2")
+
+    async def fake_events(_web_app, _job_id):
+        yield None
+        yield {"type": "audio", "index": 1}
+        yield {"type": "done"}
+
+    monkeypatch.setattr(web_module, "_iter_queue_events", fake_events)
+
+    class FakeStreamingResponse:
+        def __init__(self) -> None:
+            self.chunks: list[dict] = []
+
+        async def write(self, data: bytes) -> None:
+            self.chunks.append(json.loads(data.decode("utf-8")))
+
+    written = FakeStreamingResponse()
+    _asyncio.run(
+        web_module._stream_queue_job(app, written, "tts_stream", {"text": "hi"}, heartbeat=False)
+    )
+
+    assert written.chunks == [{"type": "audio", "index": 1}, {"type": "done"}]
+
+
+# --- fix sheet W2 regressions ------------------------------------------------
+
+
+def test_web_host_guard_rejects_rebound_host_on_every_route(tmp_path: Path, monkeypatch) -> None:
+    """Item 1: index.html carries the API token, so the Host guard cannot be /api/-only."""
+    import asyncio as _asyncio
+
+    monkeypatch.delenv("LANGCODE_ALLOWED_HOSTS", raising=False)
+    app = WebApp(tmp_path, tmp_path, enable_voice=False)
+    middleware = _auth_middleware(app)
+    headers = {"x-langcode-token": app.api_token}
+
+    rebound_index = _asyncio.run(middleware(_FakeRequest(path="/", host="evil.com")))
+    rebound_api = _asyncio.run(
+        middleware(_FakeRequest(path="/api/status", host="evil.com", headers=headers))
+    )
+    rebound_with_port = _asyncio.run(middleware(_FakeRequest(path="/", host="evil.com:8765")))
+    loopback_index = _asyncio.run(middleware(_FakeRequest(path="/", host="127.0.0.1:8765")))
+    loopback_api = _asyncio.run(
+        middleware(_FakeRequest(path="/api/status", host="127.0.0.1:8765", headers=headers))
+    )
+    localhost_index = _asyncio.run(middleware(_FakeRequest(path="/", host="localhost")))
+    ipv6_index = _asyncio.run(middleware(_FakeRequest(path="/", host="[::1]:8765")))
+
+    assert rebound_index is not None and rebound_index.status == 403
+    assert rebound_api is not None and rebound_api.status == 403
+    assert rebound_with_port is not None and rebound_with_port.status == 403
+    # the rejection must not leak the very token the attacker is after
+    assert app.api_token.encode("utf-8") not in rebound_index.body
+    assert loopback_index is None
+    assert loopback_api is None
+    assert localhost_index is None
+    assert ipv6_index is None
+
+
+def test_web_host_guard_honours_the_allowed_hosts_env(tmp_path: Path, monkeypatch) -> None:
+    import asyncio as _asyncio
+
+    monkeypatch.setenv("LANGCODE_ALLOWED_HOSTS", "dev.box.internal, 192.168.1.9")
+    app = WebApp(tmp_path, tmp_path, enable_voice=False)
+    middleware = _auth_middleware(app)
+
+    allowed = _asyncio.run(middleware(_FakeRequest(path="/", host="dev.box.internal:8765")))
+    allowed_ip = _asyncio.run(middleware(_FakeRequest(path="/", host="192.168.1.9")))
+    denied = _asyncio.run(middleware(_FakeRequest(path="/", host="other.box.internal")))
+
+    assert allowed is None
+    assert allowed_ip is None
+    assert denied is not None and denied.status == 403
+
+
+def test_web_origin_guard_compares_hostnames_not_the_host_header(tmp_path: Path) -> None:
+    """The old check compared the attacker-controlled Host with itself."""
+    import asyncio as _asyncio
+
+    app = WebApp(tmp_path, tmp_path, enable_voice=False)
+    middleware = _auth_middleware(app)
+
+    cross_origin = _asyncio.run(
+        middleware(
+            _FakeRequest(
+                path="/api/status",
+                host="127.0.0.1:8765",
+                headers={"x-langcode-token": app.api_token, "origin": "http://evil.com"},
+            )
+        )
+    )
+    same_origin = _asyncio.run(
+        middleware(
+            _FakeRequest(
+                path="/api/status",
+                host="127.0.0.1:8765",
+                headers={"x-langcode-token": app.api_token, "origin": "http://localhost:5173"},
+            )
+        )
+    )
+
+    assert cross_origin is not None and cross_origin.status == 403
+    assert same_origin is None
+
+
+def test_web_static_fallback_detects_disguised_api_paths() -> None:
+    """Item 2: every one of these used to fall through to the token-bearing index.html."""
+    from langcode_agent.interfaces.web import _is_api_path
+
+    for disguised in (
+        "api/status",
+        "/api/status",
+        "//api/status",
+        "/./api/status",
+        "./api/status",
+        "/API/status",
+        "Api/status",
+        "/%61pi/status",
+        "%2Fapi/status",
+        "/api",
+    ):
+        assert _is_api_path(disguised) is True, disguised
+
+    for static_path in ("index.html", "assets/index-abc123.js", "apifoo/status", "docs/api/status", ""):
+        assert _is_api_path(static_path) is False, static_path
+
+
+def test_web_does_not_evict_a_session_a_request_is_using(tmp_path: Path, monkeypatch) -> None:
+    """Item 3: /api/chat never marks a run started, so busy refcounts guard eviction."""
+    monkeypatch.setenv("LANGCODE_MAX_RESIDENT_SESSIONS", "1")
+    app = WebApp(tmp_path, tmp_path, enable_voice=False)
+    busy = app.get_session("busy")
+    app.acquire_session_busy("busy")
+
+    app.get_session("newcomer")
+
+    assert set(app.sessions) == {"busy", "newcomer"}
+    assert app.sessions["busy"] is busy
+
+    app.release_session_busy("busy")
+    app.get_session("late")
+
+    assert "busy" not in app.sessions
+
+
+def test_web_session_request_lock_holds_the_busy_refcount(tmp_path: Path, monkeypatch) -> None:
+    """Item 3: the pin is held for the whole request, not only while streaming."""
+    import asyncio as _asyncio
+
+    from langcode_agent.interfaces.web import SessionRequestLock
+
+    monkeypatch.setenv("LANGCODE_MAX_RESIDENT_SESSIONS", "1")
+    app = WebApp(tmp_path, tmp_path, enable_voice=False)
+    pinned = app.get_session("locked")
+
+    async def scenario() -> tuple[set[str], int]:
+        lock = SessionRequestLock(app, "locked", _asyncio.Lock())
+        async with lock:
+            assert app._session_busy["locked"] == 1
+            # a concurrent request for another session must not evict this one
+            await _asyncio.to_thread(app.get_session, "newcomer")
+            resident = set(app.sessions)
+        return resident, app._session_busy.get("locked", 0)
+
+    resident, busy_after = _asyncio.run(scenario())
+
+    assert resident == {"locked", "newcomer"}
+    assert app.sessions["locked"] is pinned
+    assert busy_after == 0
+
+
+def test_web_session_request_lock_releases_the_pin_when_entering_fails(tmp_path: Path) -> None:
+    import asyncio as _asyncio
+
+    from langcode_agent.interfaces.web import SessionRequestLock
+    from langcode_agent.storage.runtime_state import RuntimeLockTimeout
+
+    app = WebApp(tmp_path, tmp_path, enable_voice=False)
+
+    def boom(_session_id):
+        raise RuntimeLockTimeout("busy elsewhere")
+
+    app.runtime_state.acquire_session_lock = boom
+
+    async def scenario() -> None:
+        lock = SessionRequestLock(app, "unlucky", _asyncio.Lock())
+        try:
+            await lock.__aenter__()
+        except RuntimeLockTimeout:
+            return
+        raise AssertionError("expected RuntimeLockTimeout")
+
+    _asyncio.run(scenario())
+
+    assert app._session_busy.get("unlucky", 0) == 0
+
+
+def test_web_refresh_drops_a_session_deleted_by_another_worker(tmp_path: Path, monkeypatch) -> None:
+    """Item 4: the stale cache used to survive and later resurrect the session."""
+    monkeypatch.chdir(tmp_path)
+    app = WebApp(tmp_path, tmp_path, enable_voice=False)
+    session = app.get_session("doomed")
+    app._save_history(session)
+    app.store.delete_session("doomed")
+
+    app.refresh_session_from_store("doomed")
+
+    assert "doomed" not in app.sessions
+    assert app.store.load_session("doomed") is None
+
+
+def test_web_tts_stream_stays_local_when_the_worker_has_no_voice(tmp_path: Path) -> None:
+    """Item 5: queue workers run enable_voice=False, so queueing killed local TTS."""
+    from langcode_agent.interfaces.web import _tts_uses_queue
+
+    app = WebApp(tmp_path, tmp_path, enable_voice=False)
+
+    class _Queue:
+        available = True
+
+    app.job_queue = _Queue()
+    app.tts = object()
+    assert _tts_uses_queue(app) is False
+
+    app.tts = None
+    assert _tts_uses_queue(app) is True
+
+    class _NoQueue:
+        available = False
+
+    app.job_queue = _NoQueue()
+    assert _tts_uses_queue(app) is False
+
+
+class _GatedTts:
+    """Fake TTS whose second chunk only appears once the test releases it."""
+
+    def __init__(self, released) -> None:
+        self.released = released
+        self.chunks = 0
+
+    def synthesize_chunks(self, _text, voice_id="", **_kwargs):
+        self.chunks += 1
+        yield b"one", "audio/wav"
+        self.released.wait(5.0)
+        self.chunks += 1
+        yield b"two", "audio/wav"
+        self.chunks += 1
+        yield b"three", "audio/wav"
+
+
+def test_web_tts_stream_cancels_when_a_newer_turn_of_the_session_starts(tmp_path: Path) -> None:
+    """Barge-in: the superseded answer must stop mid-stream, not finish speaking."""
+    import asyncio as _asyncio
+    import threading as _threading
+
+    from langcode_agent.interfaces import web as web_module
+
+    app = WebApp(tmp_path, tmp_path, enable_voice=False)
+    released = _threading.Event()
+    app.tts = _GatedTts(released)
+    app.tts_claim_turn("s1", "turn-1")
+
+    class FakeStreamingResponse:
+        def __init__(self) -> None:
+            self.chunks: list[dict] = []
+
+        async def write(self, data: bytes) -> None:
+            self.chunks.append(json.loads(data.decode("utf-8")))
+            if len(self.chunks) == 1:
+                # The user interrupts right after hearing the first chunk.
+                app.tts_claim_turn("s1", "turn-2")
+                released.set()
+
+    written = FakeStreamingResponse()
+    _asyncio.run(
+        web_module._stream_local_tts(
+            app,
+            written,
+            {"text": "你好", "sessionId": "s1", "turnId": "turn-1", "segmentIndex": 0},
+        )
+    )
+
+    assert [chunk["type"] for chunk in written.chunks] == ["audio", "cancelled"]
+    assert [chunk["seq"] for chunk in written.chunks] == [0, 1]
+    assert written.chunks[0]["firstAudioMs"] >= 0
+    assert written.chunks[-1] == {"type": "cancelled", "turnId": "turn-1", "seq": 1}
+    # One chunk was already in flight; nothing after it is synthesized.
+    assert app.tts.chunks == 2
+
+
+def test_web_tts_stream_without_turn_ids_still_runs_to_done(tmp_path: Path) -> None:
+    """The new fields are optional: an old client's request is untouched."""
+    import asyncio as _asyncio
+    import threading as _threading
+
+    from langcode_agent.interfaces import web as web_module
+
+    app = WebApp(tmp_path, tmp_path, enable_voice=False)
+    released = _threading.Event()
+    released.set()
+    app.tts = _GatedTts(released)
+
+    class FakeStreamingResponse:
+        def __init__(self) -> None:
+            self.chunks: list[dict] = []
+
+        async def write(self, data: bytes) -> None:
+            self.chunks.append(json.loads(data.decode("utf-8")))
+
+    written = FakeStreamingResponse()
+    _asyncio.run(web_module._stream_local_tts(app, written, {"text": "你好"}))
+
+    assert [chunk["type"] for chunk in written.chunks] == ["audio", "audio", "audio", "done"]
+    assert [chunk["seq"] for chunk in written.chunks] == [0, 1, 2, 3]
+
+
+def test_web_tts_stream_stops_synthesizing_when_the_client_disconnects(tmp_path: Path) -> None:
+    """A closed socket must stop the producer thread, not fill a dead queue."""
+    import asyncio as _asyncio
+    import threading as _threading
+
+    from langcode_agent.interfaces import web as web_module
+
+    app = WebApp(tmp_path, tmp_path, enable_voice=False)
+    released = _threading.Event()
+    app.tts = _GatedTts(released)
+
+    class DisconnectingResponse:
+        async def write(self, _data: bytes) -> None:
+            released.set()
+            raise ConnectionError("client went away")
+
+    written = DisconnectingResponse()
+    raised = None
+    try:
+        _asyncio.run(web_module._stream_local_tts(app, written, {"text": "你好"}))
+    except ConnectionError as exc:
+        raised = exc
+
+    assert raised is not None
+    # The chunk that was already in flight finishes; the third is never made.
+    assert app.tts.chunks == 2
+
+
+class _FakeJsonRequest:
+    def __init__(self, payload: dict, path: str = "/api/tts/cancel") -> None:
+        self.json = payload
+        self.path = path
+        self.headers = {}
+        self.args = {}
+
+
+def _route_handler(sanic_app, path: str, method: str = "POST"):
+    for route in sanic_app.router.routes:
+        if route.path == path.lstrip("/") and method in route.methods:
+            return route.handler
+    raise AssertionError(f"route not registered: {method} {path}")
+
+
+def test_web_tts_cancel_route_marks_the_turn_stale(tmp_path: Path) -> None:
+    import asyncio as _asyncio
+
+    from sanic import Sanic
+
+    from langcode_agent.interfaces.web import create_sanic_app
+
+    app = WebApp(tmp_path, tmp_path, enable_voice=False)
+    app.tts_claim_turn("s1", "turn-1")
+    sanic_app = create_sanic_app(app, name=f"langcode-web-test-{uuid4().hex}")
+    try:
+        cancel = _route_handler(sanic_app, "/api/tts/cancel")
+        ok = _asyncio.run(cancel(_FakeJsonRequest({"sessionId": "s1", "turnId": "turn-1"})))
+        incomplete = _asyncio.run(cancel(_FakeJsonRequest({"sessionId": "s1"})))
+    finally:
+        sanic_app.ctx.gen_pool.shutdown(wait=False, cancel_futures=True)
+        Sanic.unregister_app(sanic_app)
+
+    assert ok.status == 200
+    assert json.loads(ok.body) == {"ok": True}
+    assert incomplete.status == 400
+    assert app.is_tts_turn_stale("s1", "turn-1") is True
+
+
+def test_web_tts_cancel_needs_the_api_token_in_a_header(tmp_path: Path) -> None:
+    import asyncio as _asyncio
+
+    app = WebApp(tmp_path, tmp_path, enable_voice=False)
+    middleware = _auth_middleware(app)
+
+    anonymous = _asyncio.run(middleware(_FakeRequest(path="/api/tts/cancel")))
+    # Only the ASR websocket may carry the token in the query string.
+    query = _asyncio.run(middleware(_FakeRequest(path="/api/tts/cancel", args={"token": app.api_token})))
+    allowed = _asyncio.run(
+        middleware(_FakeRequest(path="/api/tts/cancel", headers={"x-langcode-token": app.api_token}))
+    )
+
+    assert anonymous is not None and anonymous.status == 403
+    assert query is not None and query.status == 403
+    assert allowed is None
+
+
+def test_web_index_html_is_gzipped_once_and_cached(tmp_path: Path, monkeypatch) -> None:
+    """Item 9: index.html was re-read, re-templated and re-gzipped on every request."""
+    import gzip as _gzip
+
+    from langcode_agent.interfaces import web as web_module
+
+    frontend = _build_static_frontend(tmp_path / "dist")
+    app = WebApp(tmp_path, frontend, enable_voice=False)
+    web_module._INDEX_CACHE.clear()
+
+    calls: list[int] = []
+    real_compress = web_module.gzip.compress
+
+    def counting_compress(data, level=6):
+        calls.append(len(data))
+        return real_compress(data, level)
+
+    monkeypatch.setattr(web_module.gzip, "compress", counting_compress)
+
+    first = _static(app, "index.html", _FakeRequest(headers={"accept-encoding": "gzip"}))
+    second = _static(app, "index.html", _FakeRequest(headers={"accept-encoding": "gzip"}))
+    plain = _static(app, "index.html", _FakeRequest())
+
+    assert len(calls) == 1
+    assert first.headers.get("Content-Encoding") == "gzip"
+    assert second.body == first.body
+    assert app.api_token.encode("utf-8") in _gzip.decompress(first.body)
+    assert app.api_token.encode("utf-8") in plain.body
+    assert b"__LANGCODE_TOKEN__" not in plain.body
+
+    # a rebuilt frontend must not be served from the stale cache
+    (frontend / "index.html").write_text(
+        "<html><body data-token='__LANGCODE_TOKEN__'>rebuilt " + ("padding " * 400) + "</body></html>",
+        encoding="utf-8",
+    )
+    rebuilt = _static(app, "index.html", _FakeRequest())
+    assert b"rebuilt" in rebuilt.body
+
+
+def test_web_stream_error_classifier_uses_the_exception_type_first() -> None:
+    """Item 10: 'invalid parameter timeout' is a bad request, not a retriable stall."""
+    from langcode_agent.interfaces.web import _classify_stream_error
+
+    class APIStatusError(Exception):
+        pass
+
+    class BadRequestError(APIStatusError):
+        pass
+
+    class AuthenticationError(APIStatusError):
+        pass
+
+    class RateLimitError(APIStatusError):
+        pass
+
+    class APIError(Exception):
+        pass
+
+    class APIConnectionError(APIError):
+        pass
+
+    class APITimeoutError(APIConnectionError):
+        pass
+
+    assert _classify_stream_error(BadRequestError("invalid parameter 'timeout'")) == "internal"
+    assert _classify_stream_error(BadRequestError("Request timed out is not a field")) == "internal"
+    assert (
+        _classify_stream_error(BadRequestError("This model's maximum context length is 8192 tokens"))
+        == "context_overflow"
+    )
+    assert _classify_stream_error(AuthenticationError("nope")) == "auth"
+    assert _classify_stream_error(RateLimitError("slow down")) == "rate_limit"
+    # APITimeoutError subclasses APIConnectionError: the timeout must win
+    assert _classify_stream_error(APITimeoutError("boom")) == "model_timeout"
+    assert _classify_stream_error(APIConnectionError("boom")) == "network"
+    assert _classify_stream_error(TimeoutError("boom")) == "model_timeout"
+    # unknown types still fall back to the message
+    assert _classify_stream_error(RuntimeError("the request timed out")) == "model_timeout"
+    assert _classify_stream_error(RuntimeError("Error code: 401 - invalid api key")) == "auth"
+    assert _classify_stream_error(RuntimeError("nothing familiar")) == "internal"
+
+
+def test_web_stream_idle_watchdog_closes_the_blocked_iterator() -> None:
+    """Item 11: setting a flag cannot help a consumer parked on the next chunk."""
+    from langcode_agent.interfaces.web import _StreamIdleWatchdog
+
+    class _Stream:
+        def __init__(self) -> None:
+            self.closed = False
+
+        def close(self) -> None:
+            self.closed = True
+
+    stream = _Stream()
+    watchdog = _StreamIdleWatchdog(0.05, "close-me")
+    watchdog.attach(stream)
+    watchdog.start()
+    deadline = time.monotonic() + 5.0
+    while not stream.closed and time.monotonic() < deadline:
+        time.sleep(0.01)
+    watchdog.cancel()
+
+    assert watchdog.timed_out is True
+    assert stream.closed is True
+
+    # A stream whose close() explodes must not take the timer thread down.
+    class _AngryStream:
+        def close(self) -> None:
+            raise RuntimeError("generator already executing")
+
+    angry = _StreamIdleWatchdog(0.05, "angry")
+    angry.attach(_AngryStream())
+    angry.start()
+    deadline = time.monotonic() + 5.0
+    while not angry.timed_out and time.monotonic() < deadline:
+        time.sleep(0.01)
+    angry.cancel()
+    assert angry.timed_out is True
+
+    # A stream that finished normally is never closed behind the consumer's back.
+    finished = _Stream()
+    quick = _StreamIdleWatchdog(5.0, "quick")
+    quick.attach(finished)
+    quick.start()
+    quick.cancel()
+    time.sleep(0.05)
+    assert finished.closed is False
+    assert quick.timed_out is False
+
+
+def test_web_diverged_display_history_is_not_rewritten_when_unchanged(
+    tmp_path: Path, monkeypatch
+) -> None:
+    """Item 12: state_json keeps a bounded tail; the archive file holds the rest."""
+    from langcode_agent.interfaces.web import DISPLAY_TAIL_LIMIT, _display_archive_dir
+
+    monkeypatch.setenv("ZHIPU_API_KEY", "test-key")
+    monkeypatch.setenv("LANGCODE_AUTO_REFLECT", "0")
+    app = WebApp(tmp_path, tmp_path, enable_voice=False)
+    session = app.get_session("bloat")
+    session.messages = [HumanMessage(content="summary of earlier turns")]
+    session.display_messages = [AIMessage(content=f"turn {index}") for index in range(DISPLAY_TAIL_LIMIT + 30)]
+
+    app._save_history(session)
+    state = app.store.load_session("bloat")["state"]
+    archive = _display_archive_dir(tmp_path) / state["display_archive"]
+    first_mtime = archive.stat().st_mtime_ns
+
+    assert len(state["display_messages_tail"]) == DISPLAY_TAIL_LIMIT
+    assert "display_messages" not in state
+    assert len(json.loads(archive.read_text(encoding="utf-8"))["messages"]) == DISPLAY_TAIL_LIMIT + 30
+
+    app._save_history(session)
+    assert archive.stat().st_mtime_ns == first_mtime
+
+    # the archive, not the tail, is what a reload restores
+    app.sessions.pop("bloat")
+    reloaded = app.get_session("bloat")
+    assert len(reloaded.display_messages) == DISPLAY_TAIL_LIMIT + 30
+    assert reloaded.display_messages[0].content == "turn 0"
+
+    # and the tail is the fallback when the artifact file is gone
+    archive.unlink()
+    app.sessions.pop("bloat")
+    from_tail = app.get_session("bloat")
+    assert len(from_tail.display_messages) == DISPLAY_TAIL_LIMIT
+    assert from_tail.display_messages[-1].content == f"turn {DISPLAY_TAIL_LIMIT + 29}"

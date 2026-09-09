@@ -2,14 +2,20 @@ from __future__ import annotations
 
 import asyncio
 import base64
+from concurrent.futures import Future, ThreadPoolExecutor
+from collections import OrderedDict
 from dataclasses import dataclass, field
+import gzip
 import hashlib
+import logging
 from pathlib import Path
 import argparse
 import json
+import mimetypes
 import os
 import platform
 import re
+import secrets
 import subprocess
 import sqlite3
 import threading
@@ -23,9 +29,10 @@ from sanic.request import Request
 
 from ..runtime.agent import CodeAgent
 from ..voice.asr import QwenAsrService, websocket_asr_loop
+from ..voice.stream import TtsTurnRegistry, iter_tts_events
 from ..runtime.chat import build_openai_model, default_system_prompt, messages_from_json, model_settings_from_env
 from ..core.config import load_env_files
-from ..core.context_management import compact_tool_result, make_json_safe
+from ..core.context_management import compact_history_if_needed, compact_tool_result, make_json_safe
 from ..runtime.delegation import run_delegate_agent
 from ..runtime.multi_agent import iter_agent_debate_events, run_agent_debate, run_parallel_delegate_agents
 from ..runtime.deep_harness import cancel_task, create_task, get_task, list_tasks, update_task
@@ -33,15 +40,26 @@ from ..memory.project import handle_local_command, serialize_message
 from ..runtime.permissions import ToolCall, remember_shell_permission
 from ..storage.job_queue import JobQueue
 from ..storage.runtime_state import RuntimeLockTimeout, RuntimeStateStore
-from ..storage.session_store import SessionStore
+from ..storage.session_store import DELETED_REVISION, SessionStore
 from ..memory.evolution import reflect_session
 from ..voice.tts import TtsService, content_type_for_path
 from ..voice.turnsense import TurnSenseService
 from .voice_proxy import VoiceWorkerClient
 
 
+logger = logging.getLogger("langcode.web")
+
 TASK_TOOL_NAMES = {"task_create", "task_update", "task_list", "task_get", "task_cancel"}
+INTERNAL_PREVIEW_TOOL_NAMES = TASK_TOOL_NAMES | {"memory", "soul", "self_evolve", "voice_interrupt"}
 DEFAULT_WEB_SEARCH_LIMIT = 8
+DEFAULT_MAX_TOOL_ROUNDS = 30
+DEFAULT_MAX_RESIDENT_SESSIONS = 32
+DEFAULT_STREAM_IDLE_TIMEOUT_SEC = 90.0
+TOOL_RESULT_PREVIEW_CHARS = 2000
+TOOL_ROUND_LIMIT_MOCK_USER = "已达工具调用轮次上限，请基于现有信息直接作答"
+STREAM_IDLE_TIMEOUT_ERROR = "模型流在空闲超时内没有返回新内容。"
+CANCELLED_TOOL_RESULT_JSON = '{"ok": false, "cancelled": true}'
+VOICE_INTERRUPT_SUFFIX = "（此处被用户打断）"
 WEB_SEARCH_LIMIT_ERROR = "外部网页搜索次数已达到上限。请基于已获得的搜索结果回答。"
 WEB_SEARCH_LIMIT_MOCK_USER = (
     "不要再调用任何工具，不要继续搜索网页。请只基于本轮已经找到的工具结果和对话内容，"
@@ -61,26 +79,87 @@ class WebSession:
     todos: list[dict] = field(default_factory=list)
     store_path: Path | None = None
     last_reflected_count: int = 0
+    revision: int = 0
+
+
+def _load_or_create_api_token(state_dir: Path) -> str:
+    """Return the local API token, reusing the one stored under ``state_dir``.
+
+    The token guards every ``/api/*`` route. Generating a fresh one per start
+    silently invalidates every browser tab that is already open: the page holds
+    the old token in its meta tag and every request comes back 403 with no way
+    to tell that a reload is all that is needed. Persisting it (0600, inside the
+    gitignored state dir) keeps open tabs working across restarts.
+
+    ``LANGCODE_API_TOKEN`` overrides the file, for setups that inject their own.
+    A short or unreadable file is replaced rather than trusted.
+    """
+
+    override = (os.getenv("LANGCODE_API_TOKEN") or "").strip()
+    if override:
+        return override
+
+    token_path = state_dir / "api-token"
+    try:
+        existing = token_path.read_text(encoding="utf-8").strip()
+        if len(existing) >= 32 and existing.isascii():
+            return existing
+    except (OSError, UnicodeDecodeError):
+        pass
+
+    token = secrets.token_urlsafe(32)
+    try:
+        state_dir.mkdir(parents=True, exist_ok=True)
+        token_path.write_text(token, encoding="utf-8")
+        token_path.chmod(0o600)
+    except OSError:
+        logger.warning(
+            "Could not persist the local API token to %s; open browser tabs will "
+            "need a reload after every restart.",
+            token_path,
+        )
+    return token
 
 
 class WebApp:
-    def __init__(self, workspace_root: Path, frontend_dir: Path) -> None:
+    def __init__(self, workspace_root: Path, frontend_dir: Path, *, enable_voice: bool = True) -> None:
         self.workspace_root = self._resolve_workspace(workspace_root)
         load_env_files(Path.cwd(), self.workspace_root)
         self.frontend_dir = frontend_dir
-        self.sessions: dict[str, WebSession] = {}
+        self.enable_voice = enable_voice
+        # Assigned once state_dir is known, so the token can survive a restart.
+        self.api_token = ""
+        self.sessions: OrderedDict[str, WebSession] = OrderedDict()
         self._sessions_lock = threading.RLock()
+        # Item 3: how many in-flight requests currently use each session. LRU
+        # eviction must not close an agent out from under a running request -
+        # /api/chat (non-streaming) never calls mark_run_started, so
+        # has_active_run() alone does not see it.
+        self._session_busy: dict[str, int] = {}
+        self._deferred_closes: dict[str, WebSession] = {}
+        # Item 12: sha1 of the last displayed-history archive written per session,
+        # so an unchanged transcript is not rewritten on every save.
+        self._display_archive_digests: dict[str, str] = {}
         self.home_workspace_root = self.workspace_root
         self.state_dir = self.home_workspace_root / ".langcode"
+        self.api_token = _load_or_create_api_token(self.state_dir)
         self.store = SessionStore(self.state_dir / "web.sqlite")
         runtime_prefix = os.getenv("LANGCODE_REDIS_PREFIX") or (
             "langcode:" + hashlib.sha1(str(self.state_dir).encode("utf-8")).hexdigest()[:12]
         )
         self.runtime_state = RuntimeStateStore(prefix=runtime_prefix)
         self.job_queue = JobQueue(prefix=runtime_prefix)
+        self._partial_save_pool = ThreadPoolExecutor(max_workers=1, thread_name_prefix="partial-history")
+        self._partial_save_futures: dict[str, Future] = {}
+        self._cancel_displayed_text: dict[str, str] = {}
+        # Full-duplex TTS bookkeeping: newest turn per session plus the turns a
+        # client cancelled, shared with the voice worker's copy of the endpoint.
+        self._tts_turns = TtsTurnRegistry()
         self._configure_workspace_storage()
+        # A remote voice worker loads no local models, so it stays available even
+        # when this process opts out of local voice models (queue workers, item 34).
         self.voice_worker = self._voice_worker_from_env()
-        if self.voice_worker is None:
+        if enable_voice and self.voice_worker is None:
             self.turnsense = TurnSenseService()
             self.asr = QwenAsrService(turnsense=self.turnsense)
             self.tts = TtsService()
@@ -90,6 +169,12 @@ class WebApp:
             self.turnsense = None
             self.asr = None
             self.tts = None
+
+    def close(self) -> None:
+        self._partial_save_pool.shutdown(wait=True, cancel_futures=True)
+        with self._sessions_lock:
+            for session in self.sessions.values():
+                session.agent.close()
 
     def _voice_worker_from_env(self) -> VoiceWorkerClient | None:
         base_url = (os.getenv("LANGCODE_VOICE_WORKER_URL") or "").strip().rstrip("/")
@@ -114,9 +199,63 @@ class WebApp:
             raise ValueError(f"Workspace is not a directory: {candidate}")
         return candidate
 
+    def acquire_session_busy(self, session_id: str) -> None:
+        """Pin a session in memory for the duration of one request (item 3)."""
+        if not session_id:
+            return
+        with self._sessions_lock:
+            self._session_busy[session_id] = self._session_busy.get(session_id, 0) + 1
+
+    def release_session_busy(self, session_id: str) -> None:
+        """Drop one request's pin, running any close that was deferred while busy."""
+        if not session_id:
+            return
+        with self._sessions_lock:
+            remaining = self._session_busy.get(session_id, 0) - 1
+            if remaining > 0:
+                self._session_busy[session_id] = remaining
+                return
+            self._session_busy.pop(session_id, None)
+            deferred = self._deferred_closes.pop(session_id, None)
+        if deferred is not None:
+            self._close_session_agent(session_id, deferred)
+
+    def _close_session_agent(self, session_id: str, session: WebSession) -> None:
+        """Close an evicted/dropped session's agent, deferring while it is in use."""
+        with self._sessions_lock:
+            if self._session_busy.get(session_id, 0) > 0:
+                self._deferred_closes[session_id] = session
+                return
+        close = getattr(session.agent, "close", None)
+        if callable(close):
+            try:
+                close()
+            except Exception:
+                logger.exception("Failed to close session agent: %s", session_id)
+
+    def _evict_resident_sessions(self, *, keep: str = "") -> None:
+        """Keep at most LANGCODE_MAX_RESIDENT_SESSIONS sessions in memory (LRU)."""
+        limit = _max_resident_sessions()
+        with self._sessions_lock:
+            for session_id in list(self.sessions.keys()):
+                if len(self.sessions) <= limit:
+                    return
+                if (
+                    session_id == keep
+                    or self._session_busy.get(session_id, 0) > 0
+                    or self.runtime_state.has_active_run(session_id)
+                ):
+                    continue
+                session = self.sessions.pop(session_id, None)
+                if session is None:
+                    continue
+                self._close_session_agent(session_id, session)
+                self._partial_save_futures.pop(session_id, None)
+
     def get_session(self, session_id: str) -> WebSession:
         with self._sessions_lock:
             if session_id in self.sessions:
+                self.sessions.move_to_end(session_id)
                 return self.sessions[session_id]
 
             stored = self.store.load_session(session_id)
@@ -128,10 +267,7 @@ class WebApp:
                 session_workspace = self._resolve_workspace(Path(stored["workspace"]))
                 messages = messages_from_json(stored["messages"])
             state = stored.get("state") if stored else {}
-            if isinstance(state, dict) and state.get("display_messages"):
-                display_messages = messages_from_json(state.get("display_messages") or [])
-            else:
-                display_messages = _recover_display_messages_from_compaction(session_workspace, session_id, messages)
+            display_messages = _restore_display_messages(state, session_workspace, session_id, messages)
             session = WebSession(
                 id=session_id,
                 agent=CodeAgent(session_workspace, checkpoint_path=self.state_dir / "checkpoints.sqlite"),
@@ -142,8 +278,10 @@ class WebApp:
                 todos=list((state or {}).get("todos") or []) if stored else [],
                 store_path=self.store.path,
                 last_reflected_count=int((state or {}).get("last_reflected_count") or 0) if stored else 0,
+                revision=int(stored.get("revision") or 0) if stored else 0,
             )
             self.sessions[session_id] = session
+            self._evict_resident_sessions(keep=session_id)
             return session
 
     def refresh_session_from_store(self, session_id: str) -> None:
@@ -158,9 +296,21 @@ class WebApp:
         if not session_id:
             return
         with self._sessions_lock:
-            stored = self.store.load_session(session_id)
             session = self.sessions.get(session_id)
-            if stored is None or session is None:
+            if session is None:
+                return
+            revision = self.store.load_revision(session_id)
+            if revision == DELETED_REVISION:
+                # Item 4: another worker deleted this session. Keeping the stale
+                # cache alive used to resurrect it on the next save, so drop it.
+                self.sessions.pop(session_id, None)
+                self._partial_save_futures.pop(session_id, None)
+                self._close_session_agent(session_id, session)
+                return
+            if revision is None or revision == session.revision:
+                return
+            stored = self.store.load_session(session_id)
+            if stored is None:
                 return
             session_workspace = self._resolve_workspace(Path(stored["workspace"]))
             if session.workspace_root != session_workspace:
@@ -170,15 +320,13 @@ class WebApp:
                 session.model = None
             messages = messages_from_json(stored["messages"])
             state = stored.get("state") if stored else {}
-            if isinstance(state, dict) and state.get("display_messages"):
-                display_messages = messages_from_json(state.get("display_messages") or [])
-            else:
-                display_messages = _recover_display_messages_from_compaction(session_workspace, session_id, messages)
+            display_messages = _restore_display_messages(state, session_workspace, session_id, messages)
             session.messages = messages
             session.display_messages = display_messages
             session.pending = stored.get("pending")
             session.todos = list((state or {}).get("todos") or [])
             session.last_reflected_count = int((state or {}).get("last_reflected_count") or 0)
+            session.revision = int(stored.get("revision") or 0)
 
     def status(self) -> dict:
         settings = model_settings_from_env()
@@ -251,6 +399,20 @@ class WebApp:
             str(payload.get("text") or ""),
             str(payload.get("voiceId") or ""),
         )
+
+    def tts_claim_turn(self, session_id: str, turn_id: str) -> None:
+        """Make ``turn_id`` the newest TTS turn of ``session_id``."""
+        self._tts_turns.claim(session_id, turn_id)
+
+    def cancel_tts_turn(self, payload: dict) -> dict:
+        """Mark one TTS turn cancelled (barge-in / stop), stopping its producer."""
+        if not self._tts_turns.cancel(payload.get("sessionId"), payload.get("turnId")):
+            return {"ok": False, "error": "Session id and turn id are required"}
+        return {"ok": True}
+
+    def is_tts_turn_stale(self, session_id: str, turn_id: str) -> bool:
+        """True when this turn was cancelled or superseded by a newer one."""
+        return self._tts_turns.is_stale(session_id, turn_id)
 
     def _voice_status(self) -> dict[str, Any]:
         if self.voice_worker is not None:
@@ -421,7 +583,13 @@ end run
             self.store.ensure_session(session_id, str(session_workspace), title=session_id)
         return self.list_sessions()
 
-    def session_view(self, session_id: str) -> dict:
+    def session_view(self, session_id: str, before: Any = None, limit: Any = None) -> dict:
+        """Return the rendered history.
+
+        ``before``/``limit`` are optional (item 18). When both are absent the
+        response is byte-for-byte the previous full history so existing clients
+        keep working.
+        """
         if not session_id:
             return {"ok": False, "error": "Session id is required"}
         session = self.get_session(session_id)
@@ -444,14 +612,27 @@ end run
                     messages.append(agent_dialogue)
                 elif _should_show_tool_result_content(content):
                     messages.append({"role": "tool", "kind": "tool_result", "content": content})
+        total = len(messages)
+        window = _history_window(before, limit)
+        if window is None:
+            page = messages
+            start = 0
+        else:
+            before_index, page_size = window
+            end = total if before_index is None else max(0, min(before_index, total))
+            start = max(0, end - page_size)
+            page = messages[start:end]
         return {
             "ok": True,
             "sessionId": session_id,
-            "title": self.store.load_session(session_id)["title"],
+            "title": self.store.load_title(session_id) or session_id,
             "workspace": str(session.workspace_root),
-            "messages": messages,
+            "messages": page,
             "pendingApproval": session.pending,
             "todos": session.todos,
+            "total": total,
+            "firstIndex": start,
+            "hasMore": start > 0,
         }
 
     def rename_session(self, payload: dict) -> dict:
@@ -499,8 +680,18 @@ end run
         run_id = str(payload.get("runId") or "").strip()
         if not session_id or not run_id:
             return {"ok": False, "error": "Session id and run id are required"}
+        displayed = str(
+            payload.get("assistantDisplayedText") or payload.get("assistant_displayed_text") or ""
+        ).strip()
+        if displayed:
+            self._cancel_displayed_text[f"{session_id}:{run_id}"] = displayed
         self.runtime_state.cancel_run(session_id, run_id)
         return {"ok": True}
+
+    def _take_cancel_displayed_text(self, session_id: str, run_id: str | None) -> str | None:
+        if not run_id:
+            return None
+        return self._cancel_displayed_text.pop(f"{session_id}:{run_id}", None)
 
     def _is_run_cancelled(self, session_id: str, run_id: str | None) -> bool:
         if not run_id:
@@ -553,14 +744,10 @@ end run
         run_id = str(payload.get("runId") or "").strip() or None
         message = str(payload.get("message") or "").strip()
         if not message:
-            yield {"type": "error", "ok": False, "error": "Message is required"}
+            yield _error_event("Message is required", "internal")
             return
         if session.pending is not None:
-            yield {
-                "type": "error",
-                "ok": False,
-                "error": "Resolve the pending tool approval before sending a new message.",
-            }
+            yield _error_event("Resolve the pending tool approval before sending a new message.", "internal")
             return
 
         local_reply = self._handle_local_command(session, message)
@@ -572,11 +759,7 @@ end run
 
         settings = model_settings_from_env()
         if not settings.api_key:
-            yield {
-                "type": "error",
-                "ok": False,
-                "error": f"No model API key configured for provider={settings.provider}.",
-            }
+            yield _error_event(f"No model API key configured for provider={settings.provider}.", "auth")
             return
 
         if session.model is None:
@@ -598,7 +781,7 @@ end run
         session = self.get_session(str(payload.get("sessionId") or "default"))
         run_id = str(payload.get("runId") or "").strip() or None
         if session.pending is None:
-            yield {"type": "error", "ok": False, "error": "No pending approval for this session."}
+            yield _error_event("No pending approval for this session.", "internal")
             return
         if self._is_run_cancelled(session.id, run_id):
             yield {"type": "done", "ok": False, "cancelled": True}
@@ -617,6 +800,7 @@ end run
 
         result = session.agent.resume(session.id, approval)
         tool_result = _json_safe(result.get("tool_result", result))
+        tool_result = _apply_self_evolve_result(session, tool_name, tool_input, tool_result)
         task_changed = False
         if isinstance(tool_result, dict):
             tool_result = compact_tool_result(session.workspace_root, session.id, tool_name, tool_result)
@@ -639,9 +823,7 @@ end run
         if task_changed and isinstance(tool_result, dict) and isinstance(tool_result.get("todos"), list):
             yield {"type": "todos", "todos": session.todos, "summary": tool_result.get("summary", "")}
         yield _progress_event("completed", tool_name, tool_input, 1, 1, 1, tool_result)
-        tool_event = _tool_result_event(tool_name, tool_result)
-        if tool_event:
-            yield {"type": "tool_result", **tool_event}
+        yield from _stream_tool_result_events(tool_name, tool_result)
         if self._is_run_cancelled(session.id, run_id):
             yield {"type": "done", "ok": False, "cancelled": True}
             return
@@ -663,6 +845,9 @@ end run
                 remember_shell_permission(session.workspace_root, command, "allow")
         result = session.agent.resume(session.id, approval)
         tool_result = _json_safe(result.get("tool_result", result))
+        tool_result = _apply_self_evolve_result(
+            session, pending["toolName"], dict(pending.get("toolInput") or {}), tool_result
+        )
         if isinstance(tool_result, dict):
             tool_result = compact_tool_result(session.workspace_root, session.id, pending["toolName"], tool_result)
             tool_result, _task_changed = _apply_task_tool_result(
@@ -700,6 +885,7 @@ end run
         web_search_count = 0
         while True:
             web_search_limit_reached = False
+            self._compact_session_history(session)
             ai_message = session.model.invoke([*session.messages, *(extra_messages or [])])
             content = _chunk_content_text(ai_message)
             if extra_messages:
@@ -781,6 +967,7 @@ end run
                     continue
                 if tool_name == "delegate_agents":
                     tool_result = _json_safe(run_parallel_delegate_agents(session.workspace_root, **tool_input))
+                    tool_result = compact_tool_result(session.workspace_root, session.id, tool_name, tool_result)
                     tool_event = _tool_result_event(tool_name, tool_result)
                     if tool_event:
                         added.append(tool_event)
@@ -836,6 +1023,7 @@ end run
                     return response
 
                 tool_result = _json_safe(result.get("tool_result", result))
+                tool_result = _apply_self_evolve_result(session, tool_name, tool_input, tool_result)
                 if isinstance(tool_result, dict):
                     tool_result = compact_tool_result(session.workspace_root, session.id, tool_name, tool_result)
                     tool_result, task_changed = _apply_task_tool_result(session, tool_name, tool_input, tool_result)
@@ -869,6 +1057,33 @@ end run
         run_id: str | None = None,
         extra_messages: list[BaseMessage] | None = None,
     ):
+        try:
+            yield from self._continue_model_stream_events(
+                session,
+                run_id=run_id,
+                extra_messages=extra_messages,
+            )
+        finally:
+            # Item A9: never leave a partial-save future behind when the stream is
+            # abandoned (client disconnect, cancellation, generator close).
+            self._drain_partial_save(session.id)
+
+    def _drain_partial_save(self, session_id: str, *, timeout: float = 10.0) -> None:
+        future = self._partial_save_futures.pop(session_id, None)
+        if future is None:
+            return
+        try:
+            future.result(timeout=timeout)
+        except Exception:
+            logger.exception("Partial history save failed for session %s", session_id)
+
+    def _continue_model_stream_events(
+        self,
+        session: WebSession,
+        *,
+        run_id: str | None = None,
+        extra_messages: list[BaseMessage] | None = None,
+    ):
         _repair_live_tool_history(session)
         completed_tools = 0
         plan_written_this_turn = False
@@ -877,7 +1092,12 @@ end run
         turn_start_message_count = _failed_turn_start_index(session.messages)
         turn_start_display_count = _failed_turn_start_index(session.display_messages)
         web_search_count = 0
+        round_index = 0
+        tool_round_limit = _max_tool_rounds()
+        tool_round_limit_reached = False
+        idle_timeout = _stream_idle_timeout_sec()
         while True:
+            round_index += 1
             web_search_limit_reached = False
             if self._is_run_cancelled(session.id, run_id):
                 _drop_current_failed_turn(session, turn_start_message_count, turn_start_display_count)
@@ -890,16 +1110,43 @@ end run
             raw_thinking_open = False
             voice_output_filter = _VoiceModeOutputFilter() if extra_messages else None
             last_partial_save = 0.0
+            last_cancel_check = time.monotonic()
+            if self._compact_session_history(session):
+                yield _notice_event("context_compacted", "上下文已压缩，较早的对话已折叠为摘要。")
+            # Item 24: a threading.Timer flags the stall from outside the loop, so a
+            # model that goes silent is caught even while the iterator is blocked
+            # (the loop itself never sleeps or polls a clock for this).
+            watchdog = _StreamIdleWatchdog(idle_timeout, session.id)
+            stream_completed = False
             try:
-                for chunk in session.model.stream([*session.messages, *(extra_messages or [])]):
-                    if self._is_run_cancelled(session.id, run_id):
+                stream_iterator = session.model.stream([*session.messages, *(extra_messages or [])])
+                # Item 11: hand the iterator to the watchdog so a stall can try to
+                # close it instead of waiting for a chunk that never comes.
+                watchdog.attach(stream_iterator)
+                watchdog.start()
+                for chunk in stream_iterator:
+                    if watchdog.timed_out:
+                        break
+                    watchdog.beat()
+                    now = time.monotonic()
+                    should_check_remote = now - last_cancel_check >= 0.25
+                    if self.runtime_state.is_run_cancelled_local(session.id, run_id) or (
+                        should_check_remote and self._is_run_cancelled(session.id, run_id)
+                    ):
                         if partial_content:
-                            _save_cancelled_partial(session, partial_content, self._save_history)
+                            _save_cancelled_partial(
+                                session,
+                                partial_content,
+                                self._save_history,
+                                displayed_text=self._take_cancel_displayed_text(session.id, run_id),
+                            )
                         else:
                             _drop_current_failed_turn(session, turn_start_message_count, turn_start_display_count)
                             self._save_history(session)
                         yield {"type": "done", "ok": False, "cancelled": True}
                         return
+                    if should_check_remote:
+                        last_cancel_check = now
                     full_chunk = chunk if full_chunk is None else full_chunk + chunk
                     thinking = _chunk_thinking_text(chunk)
                     if thinking:
@@ -918,18 +1165,43 @@ end run
                         content = voice_output_filter.push(content)
                     if content:
                         partial_content.append(content)
-                        now = time.monotonic()
-                        if now - last_partial_save >= 1.0:
-                            self._save_history(session, extra_ai_content="".join(partial_content))
+                        if now - last_partial_save >= 3.0:
+                            self._save_partial_history(session, "".join(partial_content))
                             last_partial_save = now
                         yield {"type": "delta", "content": content}
+                else:
+                    # The iterator ran to completion. Disarm the timer right here
+                    # so a timeout raised *after* the last chunk cannot turn a
+                    # finished answer into a fake stall (item 11): cancel() and
+                    # _check() take the same lock, so exactly one of them wins.
+                    watchdog.cancel()
+                    stream_completed = not watchdog.timed_out
             except Exception as exc:
+                if not watchdog.timed_out:
+                    if partial_content:
+                        self._save_history(session, extra_ai_content="".join(partial_content))
+                    else:
+                        _drop_current_failed_turn(session, turn_start_message_count, turn_start_display_count)
+                        self._save_history(session)
+                    yield _exception_error_event(exc, context="model stream")
+                    return
+                # The watchdog closed the stalled iterator; report the stall below
+                # instead of the GeneratorExit fallout it produced.
+                logger.debug("Stalled model stream raised while being closed: %r", exc)
+            finally:
+                watchdog.cancel()
+
+            if watchdog.timed_out and not stream_completed:
                 if partial_content:
-                    self._save_history(session, extra_ai_content="".join(partial_content))
+                    _save_cancelled_partial(session, partial_content, self._save_history)
                 else:
                     _drop_current_failed_turn(session, turn_start_message_count, turn_start_display_count)
                     self._save_history(session)
-                yield {"type": "error", "ok": False, "error": f"{type(exc).__name__}: {exc}"}
+                yield _error_event(
+                    f"{STREAM_IDLE_TIMEOUT_ERROR}（{idle_timeout:g} 秒）",
+                    "model_timeout",
+                    retriable=True,
+                )
                 return
 
             if voice_output_filter is not None:
@@ -942,7 +1214,12 @@ end run
 
             if self._is_run_cancelled(session.id, run_id):
                 if partial_content:
-                    _save_cancelled_partial(session, partial_content, self._save_history)
+                    _save_cancelled_partial(
+                        session,
+                        partial_content,
+                        self._save_history,
+                        displayed_text=self._take_cancel_displayed_text(session.id, run_id),
+                    )
                 else:
                     _drop_current_failed_turn(session, turn_start_message_count, turn_start_display_count)
                     self._save_history(session)
@@ -951,8 +1228,12 @@ end run
             if full_chunk is None:
                 _drop_current_failed_turn(session, turn_start_message_count, turn_start_display_count)
                 self._save_history(session)
-                yield {"type": "error", "ok": False, "error": "Model returned no response."}
+                yield _error_event("Model returned no response.", "internal")
                 return
+
+            usage_event = _usage_event(full_chunk)
+            if usage_event is not None:
+                yield usage_event
 
             tool_calls = list(getattr(full_chunk, "tool_calls", None) or [])
             ai_content = "".join(partial_content)
@@ -980,9 +1261,26 @@ end run
                 yield {"type": "done", "ok": True}
                 return
 
+            if tool_round_limit_reached:
+                # The model kept calling tools after being told to stop: close the
+                # dangling tool calls and finish the turn with what we already have.
+                _answer_unanswered_tool_calls(session, _tool_round_limit_result(round_index))
+                self._save_history(session)
+                yield _notice_event("tool_round_limit", TOOL_ROUND_LIMIT_MOCK_USER)
+                yield {"type": "done", "ok": True}
+                return
+            if round_index >= tool_round_limit:
+                tool_round_limit_reached = True
+                _answer_unanswered_tool_calls(session, _tool_round_limit_result(round_index))
+                session.messages.append(_tool_round_limit_reminder())
+                self._save_history(session)
+                yield _notice_event("tool_round_limit", TOOL_ROUND_LIMIT_MOCK_USER)
+                continue
+
             total_tools = len(tool_calls)
             for index, raw_tool_call in enumerate(tool_calls, start=1):
                 if self._is_run_cancelled(session.id, run_id):
+                    _answer_unanswered_tool_calls(session)
                     self._save_history(session)
                     yield {"type": "done", "ok": False, "cancelled": True}
                     return
@@ -1070,12 +1368,11 @@ end run
                         completed_tools,
                         tool_result,
                     )
-                    tool_event = _tool_result_event(tool_name, tool_result)
-                    if tool_event:
-                        yield {"type": "tool_result", **tool_event}
+                    yield from _stream_tool_result_events(tool_name, tool_result)
                     continue
                 if tool_name == "delegate_agents":
                     tool_result = _json_safe(run_parallel_delegate_agents(session.workspace_root, **tool_input))
+                    tool_result = compact_tool_result(session.workspace_root, session.id, tool_name, tool_result)
                     session.messages.append(
                         ToolMessage(
                             content=_tool_result_json(tool_result),
@@ -1099,9 +1396,7 @@ end run
                         completed_tools,
                         tool_result,
                     )
-                    tool_event = _tool_result_event(tool_name, tool_result)
-                    if tool_event:
-                        yield {"type": "tool_result", **tool_event}
+                    yield from _stream_tool_result_events(tool_name, tool_result)
                     continue
                 if tool_name == "agent_debate":
                     tool_result = None
@@ -1139,6 +1434,7 @@ end run
 
                 result = session.agent.request_tool(ToolCall(tool_name, tool_input), thread_id=session.id)
                 if self._is_run_cancelled(session.id, run_id):
+                    _answer_unanswered_tool_calls(session)
                     self._save_history(session)
                     yield {"type": "done", "ok": False, "cancelled": True}
                     return
@@ -1158,6 +1454,7 @@ end run
                     return
 
                 tool_result = _json_safe(result.get("tool_result", result))
+                tool_result = _apply_self_evolve_result(session, tool_name, tool_input, tool_result)
                 if isinstance(tool_result, dict):
                     tool_result = compact_tool_result(session.workspace_root, session.id, tool_name, tool_result)
                     tool_result, task_changed = _apply_task_tool_result(session, tool_name, tool_input, tool_result)
@@ -1191,9 +1488,7 @@ end run
                     completed_tools,
                     tool_result,
                 )
-                tool_event = _tool_result_event(tool_name, tool_result)
-                if tool_event:
-                    yield {"type": "tool_result", **tool_event}
+                yield from _stream_tool_result_events(tool_name, tool_result)
 
             if web_search_limit_reached:
                 session.messages.append(_web_search_limit_reminder())
@@ -1227,7 +1522,66 @@ end run
             session.display_messages.extend(session.messages[len(before_messages) :])
         return reply
 
+    def _compact_session_history(self, session: WebSession) -> bool:
+        """Summarize old history when it exceeds the context budget (item 36).
+
+        Only ``session.messages`` (what the model sees) is compacted; the
+        UI-facing ``display_messages`` keep the full transcript. Persists when
+        anything changed. Never raises: a compaction failure must not block the
+        turn, so errors are logged and the history is left as-is.
+        """
+        try:
+            compacted, changed = compact_history_if_needed(session.messages, model=session.model)
+        except Exception:
+            logger.exception("Context compaction failed for session %s", session.id)
+            return False
+        if not changed:
+            return False
+        session.messages = list(compacted)
+        self._save_history(session)
+        return True
+
+    def _write_display_archive(self, session: WebSession, display_serialized: list[dict]) -> str:
+        """Store the full displayed history as an artifact file; return its name.
+
+        Returns "" when the file cannot be written, so the caller can fall back to
+        the inline copy rather than lose the transcript. The file is rewritten only
+        when its content actually changed, which is the common case for a session
+        that keeps chatting after a /compact.
+        """
+        try:
+            # The digest must cover only the transcript itself. Hashing the
+            # rendered payload would fold ``updatedAt`` into the key and the
+            # "unchanged" branch below could then never be taken.
+            body = json.dumps(
+                {"sessionId": session.id, "messages": display_serialized},
+                ensure_ascii=False,
+                sort_keys=True,
+            )
+            digest = hashlib.sha1(body.encode("utf-8")).hexdigest()
+            name = _display_archive_name(session.id)
+            path = _display_archive_dir(session.workspace_root) / name
+            if self._display_archive_digests.get(session.id) == digest and path.exists():
+                return name
+            payload = json.dumps(
+                {"sessionId": session.id, "updatedAt": time.time(), "messages": display_serialized},
+                ensure_ascii=False,
+            )
+            path.parent.mkdir(parents=True, exist_ok=True)
+            temporary = path.with_name(path.name + ".tmp")
+            temporary.write_text(payload, encoding="utf-8")
+            temporary.replace(path)
+            self._display_archive_digests[session.id] = digest
+            return name
+        except OSError:
+            logger.exception("Could not write the display history archive for session %s", session.id)
+            self._display_archive_digests.pop(session.id, None)
+            return ""
+
     def _save_history(self, session: WebSession, *, extra_ai_content: str | None = None) -> None:
+        pending_save = self._partial_save_futures.pop(session.id, None)
+        if pending_save is not None:
+            pending_save.result()
         messages = list(session.messages)
         display_messages = list(session.display_messages or session.messages)
         if extra_ai_content:
@@ -1235,17 +1589,53 @@ end run
             display_messages.append(AIMessage(content=extra_ai_content))
 
         serializable = _serialize_messages(messages)
+        display_serialized = _serialize_messages(display_messages)
+        # Item 6.4: display_messages normally mirrors messages minus the system
+        # prompt; only a /compact makes them genuinely diverge. In the common
+        # case store a marker instead of a second full copy of the history.
+        display_is_derived = display_serialized == _without_system_messages(serializable)
+
+        archive_name = ""
+        if not display_is_derived:
+            # Item 12: once a /compact has made the two histories diverge,
+            # display_is_derived stays False forever and every later save used to
+            # write a second full copy of the transcript into state_json. Park the
+            # full displayed history in an artifact file instead and keep only a
+            # bounded tail in the row.
+            archive_name = self._write_display_archive(session, display_serialized)
+
+        def _state() -> dict:
+            state: dict = {
+                "todos": session.todos,
+                "last_reflected_count": session.last_reflected_count,
+            }
+            if display_is_derived:
+                state["display_same_as_messages"] = True
+            elif archive_name:
+                state["display_archive"] = archive_name
+                state["display_messages_tail"] = display_serialized[-DISPLAY_TAIL_LIMIT:]
+            else:
+                # The artifact could not be written (read-only workspace, ...):
+                # never lose history, fall back to the inline copy.
+                state["display_messages"] = display_serialized
+            return state
+
         self.store.save_messages(
             session.id,
             str(session.workspace_root),
             serializable,
             pending=session.pending,
-            state={
-                "todos": session.todos,
-                "display_messages": _serialize_messages(display_messages),
-                "last_reflected_count": session.last_reflected_count,
-            },
+            state=_state(),
         )
+        # Item 38: keep checkpoints.sqlite bounded. Only prune once the turn is
+        # settled (no pending approval), so an interrupted graph can still resume.
+        if session.pending is None:
+            prune = getattr(session.agent, "prune_thread", None)
+            if callable(prune):
+                try:
+                    prune(session.id)
+                except Exception:
+                    logger.exception("Checkpoint pruning failed for session %s", session.id)
         if _auto_reflect_enabled() and extra_ai_content is None and session.pending is None:
             if len(serializable) > session.last_reflected_count and messages and isinstance(messages[-1], AIMessage):
                 reflect_session(
@@ -1261,12 +1651,30 @@ end run
                     str(session.workspace_root),
                     serializable,
                     pending=session.pending,
-                    state={
-                        "todos": session.todos,
-                        "display_messages": _serialize_messages(display_messages),
-                        "last_reflected_count": session.last_reflected_count,
-                    },
+                    state=_state(),
                 )
+        saved_revision = self.store.load_revision(session.id)
+        if saved_revision is not None and saved_revision != DELETED_REVISION:
+            session.revision = saved_revision or session.revision
+
+    def _save_partial_history(self, session: WebSession, content: str) -> None:
+        previous = self._partial_save_futures.get(session.id)
+        if previous is not None and not previous.done():
+            return
+        future = self._partial_save_pool.submit(
+            self.store.upsert_partial,
+            session.id,
+            len(session.messages),
+            "assistant",
+            content,
+        )
+        self._partial_save_futures[session.id] = future
+
+        def forget(completed: Future) -> None:
+            if self._partial_save_futures.get(session.id) is completed:
+                self._partial_save_futures.pop(session.id, None)
+
+        future.add_done_callback(forget)
 
 
 def _system_message(workspace_root: Path):
@@ -1441,12 +1849,102 @@ def _delete_checkpoint_thread(checkpoint_path: Path, thread_id: str) -> int:
         return deleted
 
 
-def _save_cancelled_partial(session: WebSession, partial_content: list[str], save_history) -> None:
-    content = "".join(partial_content).strip()
+def _truncate_partial_to_displayed(content: str, displayed_text: str | None) -> str:
+    """On a voice barge-in only the displayed prefix was actually heard/seen."""
+    text = str(content or "")
+    displayed = str(displayed_text or "").strip()
+    if not displayed or not text:
+        return text
+    if not text.startswith(displayed) or len(text) <= len(displayed):
+        return text
+    return displayed + VOICE_INTERRUPT_SUFFIX
+
+
+def _save_cancelled_partial(
+    session: WebSession,
+    partial_content: list[str],
+    save_history,
+    *,
+    displayed_text: str | None = None,
+) -> None:
+    content = _truncate_partial_to_displayed("".join(partial_content).strip(), displayed_text)
     if content:
         session.messages.append(AIMessage(content=content))
         session.display_messages.append(AIMessage(content=content))
     save_history(session)
+
+
+def _tool_round_limit_result(rounds: int) -> dict:
+    return {
+        "ok": False,
+        "error": TOOL_ROUND_LIMIT_MOCK_USER,
+        "error_type": "tool_round_limit",
+        "rounds_used": int(rounds),
+        "instruction": TOOL_ROUND_LIMIT_MOCK_USER,
+    }
+
+
+def _answer_unanswered_tool_calls(session: WebSession, tool_result: Any = None) -> int:
+    """Close dangling tool_calls so the saved history stays provider-valid.
+
+    Cancelling mid tool phase (or hitting the round limit) otherwise leaves an
+    AIMessage(tool_calls=[...]) with no matching ToolMessage, which OpenAI
+    compatible providers reject on the next request.
+    """
+    content = CANCELLED_TOOL_RESULT_JSON if tool_result is None else _tool_result_json(tool_result)
+    added = 0
+    for messages in (session.messages, session.display_messages):
+        if not messages:
+            continue
+        anchor = None
+        for index in range(len(messages) - 1, -1, -1):
+            message = messages[index]
+            if isinstance(message, AIMessage) and list(getattr(message, "tool_calls", None) or []):
+                anchor = index
+                break
+            if not isinstance(message, ToolMessage):
+                break
+        if anchor is None:
+            continue
+        answered = {
+            str(getattr(message, "tool_call_id", ""))
+            for message in messages[anchor + 1 :]
+            if isinstance(message, ToolMessage)
+        }
+        for tool_call in getattr(messages[anchor], "tool_calls", None) or []:
+            if not isinstance(tool_call, dict):
+                continue
+            tool_call_id = str(tool_call.get("id") or tool_call.get("name") or "tool")
+            if tool_call_id in answered:
+                continue
+            messages.append(ToolMessage(content=content, tool_call_id=tool_call_id))
+            answered.add(tool_call_id)
+            added += 1
+    return added
+
+
+def _truncate_interrupted_assistant_message(session: WebSession, displayed_text: str) -> bool:
+    """Trim the partial answer saved by the cancelled run to what the user actually saw."""
+    displayed = str(displayed_text or "").strip()
+    if not displayed:
+        return False
+    changed = False
+    for messages in (session.messages, session.display_messages):
+        if not messages:
+            continue
+        for index in range(len(messages) - 1, -1, -1):
+            message = messages[index]
+            if isinstance(message, HumanMessage):
+                continue
+            if not isinstance(message, AIMessage) or list(getattr(message, "tool_calls", None) or []):
+                break
+            content = str(message.content or "")
+            truncated = _truncate_partial_to_displayed(content, displayed)
+            if truncated != content:
+                messages[index] = AIMessage(content=truncated)
+                changed = True
+            break
+    return changed
 
 
 def _append_voice_interrupt_context(session: WebSession, payload: Any) -> None:
@@ -1462,6 +1960,7 @@ def _append_voice_interrupt_context(session: WebSession, payload: Any) -> None:
             payload.get("assistantDisplayedText") or payload.get("assistant_displayed_text") or ""
         ).strip(),
     }
+    _truncate_interrupted_assistant_message(session, tool_input["assistant_displayed_text"])
     tool_call_id = f"voice_interrupt_{len(session.messages)}"
     session.messages.append(
         AIMessage(
@@ -1666,6 +2165,76 @@ def _plan_execution_reminder() -> SystemMessage:
     )
 
 
+def _without_system_messages(serialized: list[dict]) -> list[dict]:
+    return [item for item in serialized if str(item.get("role") or item.get("type") or "") != "system"]
+
+
+DISPLAY_TAIL_LIMIT = 200
+DISPLAY_ARCHIVE_DIRNAME = "artifacts"
+
+
+def _display_archive_dir(workspace_root: Path) -> Path:
+    return Path(workspace_root) / ".langcode" / DISPLAY_ARCHIVE_DIRNAME
+
+
+def _display_archive_name(session_id: str) -> str:
+    """File name for a session's displayed-history archive.
+
+    The id is slugified and suffixed with a hash so two ids that differ only in
+    characters a file name cannot hold never share one archive.
+    """
+    slug = re.sub(r"[^A-Za-z0-9_.-]", "_", str(session_id))[:64] or "session"
+    digest = hashlib.sha1(str(session_id).encode("utf-8")).hexdigest()[:8]
+    return f"display-{slug}-{digest}.json"
+
+
+def _read_display_archive(workspace_root: Path, session_id: str, name: str) -> list[BaseMessage] | None:
+    if not name or "/" in name or "\\" in name or name.startswith("."):
+        return None
+    path = _display_archive_dir(workspace_root) / name
+    try:
+        payload = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return None
+    serialized = payload.get("messages") if isinstance(payload, dict) else None
+    if not serialized:
+        return None
+    return messages_from_json(serialized)
+
+
+def _restore_display_messages(
+    state: Any,
+    workspace_root: Path,
+    session_id: str,
+    messages: list[BaseMessage],
+) -> list[BaseMessage]:
+    """Rebuild the user-visible history from ``state_json``.
+
+    Shapes supported, newest first:
+      * ``display_archive`` + ``display_messages_tail`` (item 12) - the full
+        displayed history lives in ``.langcode/artifacts``, and only a bounded
+        tail is kept in the row; the tail is the fallback if the file is gone;
+      * ``display_same_as_messages`` marker (item 6.4) - no second copy stored;
+      * a full ``display_messages`` copy - what older builds wrote whenever a
+        /compact made the displayed history diverge from the model history;
+      * none of those (sessions written before state_json existed) - fall back to
+        the lossy compaction-archive recovery.
+    """
+    if isinstance(state, dict):
+        archive_name = str(state.get("display_archive") or "")
+        if archive_name:
+            restored = _read_display_archive(workspace_root, session_id, archive_name)
+            if restored:
+                return restored
+        if state.get("display_messages"):
+            return messages_from_json(state.get("display_messages") or [])
+        if state.get("display_messages_tail"):
+            return messages_from_json(state.get("display_messages_tail") or [])
+        if state.get("display_same_as_messages"):
+            return [message for message in messages if not isinstance(message, SystemMessage)]
+    return _recover_display_messages_from_compaction(workspace_root, session_id, messages)
+
+
 def _recover_display_messages_from_compaction(
     workspace_root: Path,
     session_id: str,
@@ -1817,45 +2386,211 @@ def _directory_roots(workspace_root: Path) -> list[dict]:
     return roots
 
 
-def create_sanic_app(web_app: WebApp) -> Sanic:
-    sanic_app = Sanic("langcode-web")
-    sanic_app.config.REQUEST_TIMEOUT = 3600
-    sanic_app.config.RESPONSE_TIMEOUT = 3600
-    sanic_app.ctx.web_app = web_app
-    sanic_app.ctx.session_locks = {}
-    sanic_app.ctx.session_locks_guard = asyncio.Lock()
-    sanic_app.ctx.workspace_lock = asyncio.Lock()
+QUERY_TOKEN_ROUTES = {"/api/asr/stream"}
 
-    class SessionRequestLock:
-        def __init__(self, session_id: str, local_lock: asyncio.Lock) -> None:
-            self.session_id = session_id
-            self.local_lock = local_lock
-            self.lease = None
+# Item 1: the loopback names a browser may legitimately use to reach a local
+# LangCode. Anything else in the Host header means the request arrived through a
+# name that resolves elsewhere - the classic DNS-rebinding setup, where a page on
+# http://evil.com re-points that name at 127.0.0.1 and then reads ``/`` to lift
+# the API token embedded in index.html.
+LOCAL_HOSTNAMES = frozenset({"127.0.0.1", "localhost", "::1", "[::1]"})
 
-        async def __aenter__(self):
-            await self.local_lock.acquire()
+
+def _hostname_of(value: str) -> str:
+    """Hostname of a ``Host`` header or origin authority, port and brackets removed."""
+    raw = str(value or "").strip()
+    if not raw:
+        return ""
+    try:
+        hostname = urlparse(raw if "//" in raw else f"//{raw}").hostname
+    except ValueError:
+        return ""
+    return (hostname or "").strip().lower()
+
+
+def allowed_hostnames() -> set[str]:
+    """Loopback names plus the comma-separated ``LANGCODE_ALLOWED_HOSTS`` extras."""
+    allowed = {name.strip("[]") for name in LOCAL_HOSTNAMES} | set(LOCAL_HOSTNAMES)
+    for item in str(os.getenv("LANGCODE_ALLOWED_HOSTS") or "").split(","):
+        name = _hostname_of(item) or item.strip().lower()
+        if name:
+            allowed.add(name)
+    return allowed
+
+
+def reject_untrusted_host_sync(web_app: WebApp, request: Request):
+    """Host/Origin guard for EVERY route, not just ``/api/`` (item 1).
+
+    ``/`` and ``/<path>`` serve an index.html with the API token baked in, so the
+    token leaks unless this runs before any handler. Ports are ignored; only the
+    hostname is compared. The 403 body deliberately carries no token.
+    """
+    allowed = allowed_hostnames()
+    if _hostname_of(getattr(request, "host", "") or "") not in allowed:
+        return response.json({"ok": False, "error": "Rejected Host header"}, status=403)
+    origin = request.headers.get("origin")
+    if origin:
+        # Compare hostnames against the allowlist, never ``netloc != request.host``:
+        # that compares the attacker-controlled Host with itself and passes after
+        # a rebinding.
+        try:
+            origin_host = (urlparse(origin).hostname or "").strip().lower()
+        except ValueError:
+            origin_host = ""
+        if origin_host not in allowed:
+            return response.json({"ok": False, "error": "Cross-origin request rejected"}, status=403)
+    return None
+
+
+def _tts_uses_queue(web_app: WebApp) -> bool:
+    """Offload TTS to the queue only when this process has no local TTS (item 5).
+
+    Queue workers start with ``enable_voice=False`` by default, so routing every
+    TTS request to the queue just because Redis is reachable made TTS fail with
+    "TTS service is not available." on a server that could have synthesized it
+    locally. A remote voice worker is handled before this branch.
+    """
+    return bool(web_app.job_queue.available and web_app.tts is None)
+
+
+def _is_api_path(requested: str) -> bool:
+    """True when a static path would shadow the ``/api/`` namespace (item 2).
+
+    ``//api/status``, ``/./api/status``, ``/API/status`` and ``/%61pi/status`` all
+    slip past a naive ``path.startswith("api/")`` test yet still reach the SPA
+    fallback, which answers with the token-bearing index.html.
+    """
+    raw = unquote(str(requested or "")).replace("\\", "/")
+    segments = [segment for segment in raw.split("/") if segment not in ("", ".")]
+    return bool(segments) and segments[0].lower() == "api"
+
+
+def authorize_api_request_sync(web_app: WebApp, request: Request):
+    """Auth check for /api/* requests. Returns a 403 response or None when allowed."""
+    if not request.path.startswith("/api/"):
+        return None
+    supplied_token = request.headers.get("x-langcode-token") or ""
+    # A token in the query string leaks into browser history and access logs, so
+    # it is accepted only for the ASR WebSocket, which cannot send headers.
+    if not supplied_token and request.path in QUERY_TOKEN_ROUTES:
+        supplied_token = request.args.get("token") or ""
+    try:
+        authorized = secrets.compare_digest(str(supplied_token).encode("ascii"), web_app.api_token.encode("ascii"))
+    except (UnicodeEncodeError, UnicodeDecodeError, TypeError):
+        authorized = False
+    if not authorized:
+        return response.json({"ok": False, "error": "Unauthorized local API request"}, status=403)
+    # The Origin check now lives in reject_untrusted_host_sync, which runs for
+    # every route (including the token-bearing index.html) instead of only /api/.
+    return None
+
+
+class SessionRequestLock:
+    """Serialize one session's requests, locally and across processes.
+
+    Item 3: besides the asyncio lock and the distributed lease, entering also
+    pins the session in memory for the whole request. ``/api/chat`` never calls
+    ``mark_run_started``, so without the pin a concurrent ``get_session`` could
+    LRU-evict and ``close()`` the very session this request is working on, and
+    the second live copy would then save over it.
+    """
+
+    def __init__(self, web_app: WebApp, session_id: str, local_lock: asyncio.Lock) -> None:
+        self.web_app = web_app
+        self.session_id = session_id
+        self.local_lock = local_lock
+        self.lease = None
+        self.busy = False
+
+    async def __aenter__(self) -> "SessionRequestLock":
+        await self.local_lock.acquire()
+        self.web_app.acquire_session_busy(self.session_id)
+        self.busy = True
+        try:
+            self.lease = await asyncio.to_thread(
+                self.web_app.runtime_state.acquire_session_lock, self.session_id
+            )
+            await asyncio.to_thread(self.web_app.refresh_session_from_store, self.session_id)
+        except Exception:
+            self.busy = False
+            self.web_app.release_session_busy(self.session_id)
+            self.local_lock.release()
+            raise
+        return self
+
+    async def __aexit__(self, exc_type, exc, traceback) -> None:
+        try:
+            if self.lease is not None:
+                await asyncio.to_thread(self.lease.release)
+        finally:
             try:
-                self.lease = await asyncio.to_thread(web_app.runtime_state.acquire_session_lock, self.session_id)
-                await asyncio.to_thread(web_app.refresh_session_from_store, self.session_id)
-            except Exception:
-                self.local_lock.release()
-                raise
-            return self
-
-        async def __aexit__(self, exc_type, exc, traceback):
-            try:
-                if self.lease is not None:
-                    await asyncio.to_thread(self.lease.release)
+                if self.busy:
+                    self.busy = False
+                    self.web_app.release_session_busy(self.session_id)
             finally:
                 self.local_lock.release()
 
+
+DISCONNECT_PRODUCER_WAIT_SEC = 30.0
+
+
+async def _drain_stream_producer(producer, *, context: str) -> None:
+    """Wait for a detached producer, but never block the connection teardown forever."""
+    try:
+        await asyncio.wait_for(asyncio.shield(producer), timeout=DISCONNECT_PRODUCER_WAIT_SEC)
+    except asyncio.TimeoutError:
+        logger.warning(
+            "%s producer still running %ss after client disconnect; detaching",
+            context,
+            DISCONNECT_PRODUCER_WAIT_SEC,
+        )
+    except Exception:
+        logger.exception("%s producer failed after client disconnect", context)
+
+
+def create_sanic_app(web_app: WebApp, *, name: str = "langcode-web") -> Sanic:
+    # ``name`` is overridable because Sanic keeps a process-wide app registry and
+    # refuses to register two apps under the same name (tests build several).
+    sanic_app = Sanic(name)
+    sanic_app.config.REQUEST_TIMEOUT = 3600
+    sanic_app.config.RESPONSE_TIMEOUT = 3600
+    sanic_app.ctx.web_app = web_app
+    sanic_app.ctx.session_locks = OrderedDict()
+    sanic_app.ctx.session_locks_guard = asyncio.Lock()
+    sanic_app.ctx.workspace_lock = asyncio.Lock()
+    sanic_app.ctx.gen_pool = ThreadPoolExecutor(
+        max_workers=max(1, int(os.getenv("LANGCODE_GENERATION_WORKERS", "16"))),
+        thread_name_prefix="generation",
+    )
+
+    @sanic_app.middleware("request")
+    async def authorize_api_request(request: Request):
+        # Host/Origin first (item 1): it covers every route, so a rebound name is
+        # refused before any handler can echo the API token back in index.html.
+        rejected = reject_untrusted_host_sync(web_app, request)
+        if rejected is not None:
+            return rejected
+        return authorize_api_request_sync(web_app, request)
+
     async def session_lock(session_id: str) -> SessionRequestLock:
         async with sanic_app.ctx.session_locks_guard:
-            lock = sanic_app.ctx.session_locks.get(session_id)
+            locks = sanic_app.ctx.session_locks
+            lock = locks.get(session_id)
             if lock is None:
                 lock = asyncio.Lock()
-                sanic_app.ctx.session_locks[session_id] = lock
-            return SessionRequestLock(session_id, lock)
+            else:
+                locks.pop(session_id, None)
+            locks[session_id] = lock
+            # Item 25: bound the lock table with the same LRU limit as sessions;
+            # only idle locks are evicted, so an in-flight request keeps its lock.
+            limit = _max_resident_sessions()
+            for candidate in list(locks.keys()):
+                if len(locks) <= limit:
+                    break
+                if candidate == session_id or locks[candidate].locked():
+                    continue
+                locks.pop(candidate, None)
+            return SessionRequestLock(web_app, session_id, lock)
 
     async def run_json(fn, *args) -> response.HTTPResponse:
         try:
@@ -1910,54 +2645,42 @@ def create_sanic_app(web_app: WebApp) -> Sanic:
     @sanic_app.post("/api/tts/stream")
     async def tts_stream(request: Request):
         payload = _request_json(request)
-        text = str(payload.get("text") or "")
-        voice_id = str(payload.get("voiceId") or "")
+        # A new turn supersedes the previous one for this session before any
+        # audio is produced, so the older producer stops at its next check even
+        # when its own request is still connected (full-duplex barge-in).
+        web_app.tts_claim_turn(str(payload.get("sessionId") or ""), str(payload.get("turnId") or ""))
 
         async def stream(streaming_response):
             if web_app.voice_worker is not None:
+                # The payload (sessionId/turnId/segmentIndex included) goes to
+                # the worker unchanged; the worker runs the same stop logic and
+                # sees this client's disconnect as its own upstream close.
                 async for event in web_app.voice_worker.stream_tts(payload):
                     await streaming_response.write(json.dumps(event, ensure_ascii=False).encode("utf-8") + b"\n")
                 return
-            if web_app.job_queue.available:
+            if _tts_uses_queue(web_app):
                 await _stream_queue_job(web_app, streaming_response, "tts_stream", payload, heartbeat=False)
                 return
-            event_queue: asyncio.Queue[dict[str, Any] | None] = asyncio.Queue()
-            loop = asyncio.get_running_loop()
-
-            def produce_audio() -> None:
-                try:
-                    if web_app.tts is None:
-                        raise RuntimeError("TTS service is not available.")
-                    for index, (audio, content_type) in enumerate(web_app.tts.synthesize_chunks(text, voice_id=voice_id), start=1):
-                        event = {
-                            "type": "audio",
-                            "index": index,
-                            "contentType": content_type,
-                            "audio": base64.b64encode(audio).decode("ascii"),
-                        }
-                        loop.call_soon_threadsafe(event_queue.put_nowait, event)
-                    loop.call_soon_threadsafe(event_queue.put_nowait, {"type": "done"})
-                except Exception as exc:
-                    loop.call_soon_threadsafe(
-                        event_queue.put_nowait,
-                        {"type": "error", "ok": False, "error": f"{type(exc).__name__}: {exc}"},
-                    )
-                finally:
-                    loop.call_soon_threadsafe(event_queue.put_nowait, None)
-
-            producer = asyncio.create_task(asyncio.to_thread(produce_audio))
-            while True:
-                event = await event_queue.get()
-                if event is None:
-                    break
-                await streaming_response.write(json.dumps(event, ensure_ascii=False).encode("utf-8") + b"\n")
-            await producer
+            await _stream_local_tts(web_app, streaming_response, payload)
 
         return response.ResponseStream(
             stream,
             content_type="application/x-ndjson; charset=utf-8",
             headers={"Cache-Control": "no-cache"},
         )
+
+    @sanic_app.post("/api/tts/cancel")
+    async def tts_cancel(request: Request):
+        payload = _request_json(request)
+        result = web_app.cancel_tts_turn(payload)
+        if web_app.voice_worker is not None:
+            # Best effort: the worker owns the producer in that deployment, but a
+            # failed hop must not turn the local cancel into a client error.
+            try:
+                await web_app.voice_worker.cancel_tts(payload)
+            except Exception as exc:
+                logger.warning("tts cancel could not reach the voice worker: %s", exc)
+        return response.json(result, status=200 if result.get("ok") else 400)
 
     @sanic_app.websocket("/api/asr/stream")
     async def asr_stream(_request: Request, ws):
@@ -1980,10 +2703,12 @@ def create_sanic_app(web_app: WebApp) -> Sanic:
     @sanic_app.get("/api/session")
     async def session_view(request: Request):
         session_id = request.args.get("sessionId") or ""
+        before = request.args.get("before")
+        limit = request.args.get("limit")
         lock = await session_lock(session_id)
         try:
             async with lock:
-                return await run_json(web_app.session_view, session_id)
+                return await run_json(web_app.session_view, session_id, before, limit)
         except RuntimeLockTimeout as exc:
             return response.json({"ok": False, "error": str(exc)}, status=409)
 
@@ -2012,7 +2737,7 @@ def create_sanic_app(web_app: WebApp) -> Sanic:
             try:
                 await lock.__aenter__()
             except RuntimeLockTimeout as exc:
-                event = {"type": "error", "ok": False, "error": str(exc)}
+                event = _error_event(str(exc), "rate_limit")
                 await streaming_response.write(json.dumps(event, ensure_ascii=False).encode("utf-8") + b"\n")
                 return
             try:
@@ -2025,27 +2750,29 @@ def create_sanic_app(web_app: WebApp) -> Sanic:
                         for event in web_app.chat_events(payload):
                             loop.call_soon_threadsafe(event_queue.put_nowait, event)
                     except Exception as exc:
-                        loop.call_soon_threadsafe(
-                            event_queue.put_nowait,
-                            {"type": "error", "ok": False, "error": f"{type(exc).__name__}: {exc}"},
-                        )
+                        loop.call_soon_threadsafe(event_queue.put_nowait, _exception_error_event(exc))
                     finally:
                         loop.call_soon_threadsafe(event_queue.put_nowait, None)
 
-                producer = asyncio.create_task(asyncio.to_thread(produce_events))
+                producer = asyncio.ensure_future(loop.run_in_executor(sanic_app.ctx.gen_pool, produce_events))
                 waiting_count = 0
-                while True:
-                    try:
-                        event = await asyncio.wait_for(event_queue.get(), timeout=4.0)
-                        waiting_count = 0
-                    except asyncio.TimeoutError:
-                        waiting_count += 1
-                        event = _stream_waiting_event(waiting_count)
-                    if event is None:
-                        break
-                    data = json.dumps(event, ensure_ascii=False).encode("utf-8") + b"\n"
-                    await streaming_response.write(data)
-                await producer
+                try:
+                    while True:
+                        try:
+                            event = await asyncio.wait_for(event_queue.get(), timeout=4.0)
+                            waiting_count = 0
+                        except asyncio.TimeoutError:
+                            waiting_count += 1
+                            event = _stream_waiting_event(waiting_count)
+                        if event is None:
+                            break
+                        data = json.dumps(event, ensure_ascii=False).encode("utf-8") + b"\n"
+                        await streaming_response.write(data)
+                    await producer
+                except (asyncio.CancelledError, ConnectionError, BrokenPipeError):
+                    await asyncio.to_thread(web_app.runtime_state.cancel_run, session_id, run_id)
+                    await _drain_stream_producer(producer, context="chat-stream")
+                    raise
             finally:
                 try:
                     await asyncio.to_thread(web_app.runtime_state.mark_run_finished, session_id, run_id)
@@ -2073,7 +2800,7 @@ def create_sanic_app(web_app: WebApp) -> Sanic:
             try:
                 await lock.__aenter__()
             except RuntimeLockTimeout as exc:
-                event = {"type": "error", "ok": False, "error": str(exc)}
+                event = _error_event(str(exc), "rate_limit")
                 await streaming_response.write(json.dumps(event, ensure_ascii=False).encode("utf-8") + b"\n")
                 return
             try:
@@ -2086,27 +2813,29 @@ def create_sanic_app(web_app: WebApp) -> Sanic:
                         for event in web_app.approval_events(payload):
                             loop.call_soon_threadsafe(event_queue.put_nowait, event)
                     except Exception as exc:
-                        loop.call_soon_threadsafe(
-                            event_queue.put_nowait,
-                            {"type": "error", "ok": False, "error": f"{type(exc).__name__}: {exc}"},
-                        )
+                        loop.call_soon_threadsafe(event_queue.put_nowait, _exception_error_event(exc))
                     finally:
                         loop.call_soon_threadsafe(event_queue.put_nowait, None)
 
-                producer = asyncio.create_task(asyncio.to_thread(produce_events))
+                producer = asyncio.ensure_future(loop.run_in_executor(sanic_app.ctx.gen_pool, produce_events))
                 waiting_count = 0
-                while True:
-                    try:
-                        event = await asyncio.wait_for(event_queue.get(), timeout=4.0)
-                        waiting_count = 0
-                    except asyncio.TimeoutError:
-                        waiting_count += 1
-                        event = _stream_waiting_event(waiting_count)
-                    if event is None:
-                        break
-                    data = json.dumps(event, ensure_ascii=False).encode("utf-8") + b"\n"
-                    await streaming_response.write(data)
-                await producer
+                try:
+                    while True:
+                        try:
+                            event = await asyncio.wait_for(event_queue.get(), timeout=4.0)
+                            waiting_count = 0
+                        except asyncio.TimeoutError:
+                            waiting_count += 1
+                            event = _stream_waiting_event(waiting_count)
+                        if event is None:
+                            break
+                        data = json.dumps(event, ensure_ascii=False).encode("utf-8") + b"\n"
+                        await streaming_response.write(data)
+                    await producer
+                except (asyncio.CancelledError, ConnectionError, BrokenPipeError):
+                    await asyncio.to_thread(web_app.runtime_state.cancel_run, session_id, run_id)
+                    await _drain_stream_producer(producer, context="approval-stream")
+                    raise
             finally:
                 try:
                     await asyncio.to_thread(web_app.runtime_state.mark_run_finished, session_id, run_id)
@@ -2195,16 +2924,89 @@ def create_sanic_app(web_app: WebApp) -> Sanic:
         return await run_json(web_app.choose_directory, _request_json(request))
 
     @sanic_app.get("/")
-    async def index(_request: Request):
-        return await _static_response(web_app, "index.html")
+    async def index(request: Request):
+        return await _static_response(web_app, "index.html", request)
 
     @sanic_app.get("/<path:path>")
-    async def static_files(_request: Request, path: str):
-        if path.startswith("api/"):
+    async def static_files(request: Request, path: str):
+        if _is_api_path(path) or _is_api_path(request.path):
             return response.json({"ok": False, "error": "Not found"}, status=404)
-        return await _static_response(web_app, path)
+        return await _static_response(web_app, path, request)
+
+    @sanic_app.after_server_stop
+    async def close_resources(_app: Sanic):
+        _app.ctx.gen_pool.shutdown(wait=True, cancel_futures=True)
+        web_app.close()
 
     return sanic_app
+
+
+async def _stream_local_tts(web_app: WebApp, streaming_response, payload: dict) -> None:
+    """Stream NDJSON TTS events produced by this process's own TtsService.
+
+    Synthesis blocks, so it runs in a thread and reaches the socket through a
+    queue. The thread cannot be killed, but it checks ``should_stop`` between
+    chunks, so it outlives a barge-in or a disconnect by at most one chunk
+    instead of speaking a whole superseded answer into a dead socket.
+    """
+    text = str(payload.get("text") or "")
+    voice_id = str(payload.get("voiceId") or "")
+    session_id = str(payload.get("sessionId") or "").strip()
+    turn_id = str(payload.get("turnId") or "").strip()
+    segment_index = _segment_index(payload)
+    if turn_id:
+        logger.debug("tts stream turn=%s segment=%d chars=%d", turn_id, segment_index, len(text))
+    started_at = time.perf_counter()
+    event_queue: asyncio.Queue[dict[str, Any] | None] = asyncio.Queue()
+    loop = asyncio.get_running_loop()
+    disconnected = threading.Event()
+
+    def should_stop() -> bool:
+        return disconnected.is_set() or web_app.is_tts_turn_stale(session_id, turn_id)
+
+    def produce_audio() -> None:
+        try:
+            if web_app.tts is None:
+                raise RuntimeError("TTS service is not available.")
+            # Shared producer with voice_worker/worker: audio events, an
+            # optional tts_fallback notice, then one terminal done/error.
+            for event in iter_tts_events(
+                web_app.tts,
+                text,
+                voice_id=voice_id,
+                should_stop=should_stop,
+                turn_id=turn_id,
+                started_at=started_at,
+            ):
+                loop.call_soon_threadsafe(event_queue.put_nowait, event)
+        except Exception as exc:
+            loop.call_soon_threadsafe(
+                event_queue.put_nowait,
+                {"type": "error", "ok": False, "error": f"{type(exc).__name__}: {exc}"},
+            )
+        finally:
+            loop.call_soon_threadsafe(event_queue.put_nowait, None)
+
+    producer = asyncio.create_task(asyncio.to_thread(produce_audio))
+    try:
+        while True:
+            event = await event_queue.get()
+            if event is None:
+                break
+            await streaming_response.write(json.dumps(event, ensure_ascii=False).encode("utf-8") + b"\n")
+        await producer
+    except (asyncio.CancelledError, ConnectionError, BrokenPipeError):
+        disconnected.set()
+        await _drain_stream_producer(producer, context="tts-stream")
+        raise
+
+
+def _segment_index(payload: dict) -> int:
+    """``segmentIndex`` of a TTS request; 0 when absent or malformed."""
+    try:
+        return max(0, int(payload.get("segmentIndex") or 0))
+    except (TypeError, ValueError):
+        return 0
 
 
 async def _stream_queue_job(
@@ -2218,16 +3020,11 @@ async def _stream_queue_job(
     try:
         job_id = await asyncio.to_thread(web_app.job_queue.enqueue, kind, payload)
     except Exception as exc:
-        event = {"type": "error", "ok": False, "error": f"{type(exc).__name__}: {exc}"}
+        event = _exception_error_event(exc, context="queue enqueue")
         await streaming_response.write(json.dumps(event, ensure_ascii=False).encode("utf-8") + b"\n")
         return
-    event_iter = web_app.job_queue.iter_events(job_id, block_ms=4000)
     waiting_count = 0
-    while True:
-        try:
-            event = await asyncio.to_thread(next, event_iter)
-        except Exception as exc:
-            event = {"type": "error", "ok": False, "error": f"{type(exc).__name__}: {exc}"}
+    async for event in _iter_queue_events(web_app, job_id):
         if event is None:
             if heartbeat:
                 waiting_count += 1
@@ -2241,6 +3038,27 @@ async def _stream_queue_job(
         await streaming_response.write(json.dumps(event, ensure_ascii=False).encode("utf-8") + b"\n")
         if event.get("type") in {"done", "error"}:
             break
+
+
+async def _iter_queue_events(web_app: WebApp, job_id: str):
+    """Yield job events, preferring a native async xread over a thread per event."""
+    if web_app.job_queue.async_events_supported:
+        try:
+            async for event in web_app.job_queue.aiter_events(job_id, block_ms=4000):
+                yield event
+            return
+        except Exception as exc:
+            yield _exception_error_event(exc, context="queue events")
+            return
+    event_iter = web_app.job_queue.iter_events(job_id, block_ms=4000)
+    while True:
+        try:
+            yield await asyncio.to_thread(next, event_iter)
+        except StopIteration:
+            return
+        except Exception as exc:
+            yield _exception_error_event(exc, context="queue events")
+            return
 
 
 def _request_json(request: Request) -> dict:
@@ -2263,20 +3081,210 @@ def _session_id(payload: dict) -> str:
     return str(payload.get("sessionId") or "default")
 
 
+DEFAULT_HISTORY_PAGE_SIZE = 100
+MAX_HISTORY_PAGE_SIZE = 1000
+
+
+def _history_window(before: Any, limit: Any) -> tuple[int | None, int] | None:
+    """Parse ?before=&limit=; ``None`` means "return the full history" (default)."""
+    if (before is None or str(before).strip() == "") and (limit is None or str(limit).strip() == ""):
+        return None
+    before_index: int | None = None
+    if before is not None and str(before).strip() != "":
+        try:
+            before_index = max(0, int(str(before).strip()))
+        except (TypeError, ValueError):
+            before_index = None
+    page_size = DEFAULT_HISTORY_PAGE_SIZE
+    if limit is not None and str(limit).strip() != "":
+        try:
+            page_size = int(str(limit).strip())
+        except (TypeError, ValueError):
+            page_size = DEFAULT_HISTORY_PAGE_SIZE
+    page_size = max(1, min(page_size, MAX_HISTORY_PAGE_SIZE))
+    return before_index, page_size
+
+
 def _stream_waiting_event(waiting_count: int = 1) -> dict:
-    elapsed = max(4, waiting_count * 4)
-    labels = [
-        f"模型响应较慢，已等待约 {elapsed} 秒，连接仍保持中。",
-        f"仍在等待模型返回下一段内容，已等待约 {elapsed} 秒。",
-        f"长时间无新内容时可以点击停止按钮结束当前轮次，当前已等待约 {elapsed} 秒。",
-    ]
-    return {
-        "type": "progress",
-        "status": "running",
-        "toolName": "model",
-        "completed": 0,
-        "label": labels[(waiting_count - 1) % len(labels)],
+    """Keep-alive heartbeat for the ndjson stream (never a fake tool progress event)."""
+    return {"type": "heartbeat", "waitedSec": int(max(4, waiting_count * 4))}
+
+
+RETRIABLE_ERROR_CODES = {"rate_limit", "model_timeout", "network"}
+
+
+_AUTH_ERROR_TYPES = frozenset({"AuthenticationError", "PermissionDeniedError"})
+_RATE_LIMIT_ERROR_TYPES = frozenset({"RateLimitError"})
+_TIMEOUT_ERROR_TYPES = frozenset(
+    {
+        "APITimeoutError",
+        "Timeout",
+        "TimeoutError",
+        "TimeoutException",
+        "ReadTimeout",
+        "WriteTimeout",
+        "ConnectTimeout",
+        "PoolTimeout",
+        "ReadTimeoutError",
+        "ConnectTimeoutError",
     }
+)
+_NETWORK_ERROR_TYPES = frozenset(
+    {
+        "APIConnectionError",
+        "ConnectionError",
+        "ConnectError",
+        "SSLError",
+        "RemoteProtocolError",
+        "ProtocolError",
+        "NetworkError",
+    }
+)
+# Known API failures that are none of the above. Their message may legitimately
+# contain the word "timeout" (a rejected request parameter, say), so the loose
+# string fallbacks below must not run for them.
+_REQUEST_ERROR_TYPES = frozenset(
+    {
+        "BadRequestError",
+        "UnprocessableEntityError",
+        "NotFoundError",
+        "ConflictError",
+        "InternalServerError",
+        "APIStatusError",
+        "APIResponseValidationError",
+    }
+)
+
+
+def _looks_like_context_overflow(message: str) -> bool:
+    return (
+        "context length" in message
+        or "maximum context" in message
+        or "context_length_exceeded" in message
+        or "context window" in message
+        or ("token" in message and "length" in message)
+    )
+
+
+def _classify_stream_error(exc: BaseException) -> str:
+    """Map a stream failure onto a UI error code (item 10).
+
+    The exception *type* decides first; the message is only consulted for types
+    we do not recognise. The old substring-first order mislabelled anything whose
+    text merely mentioned "timeout" (e.g. ``BadRequestError: invalid parameter
+    'timeout'``) as a retriable ``model_timeout``.
+    """
+    names = {type(exc).__name__}
+    for base in type(exc).__mro__:
+        names.add(base.__name__)
+    message = f"{exc}".lower()
+
+    if names & _AUTH_ERROR_TYPES:
+        return "auth"
+    if names & _RATE_LIMIT_ERROR_TYPES:
+        return "rate_limit"
+    # APITimeoutError subclasses APIConnectionError, so timeouts are matched first.
+    if names & _TIMEOUT_ERROR_TYPES:
+        return "model_timeout"
+    if names & _NETWORK_ERROR_TYPES:
+        return "network"
+    if _looks_like_context_overflow(message):
+        return "context_overflow"
+    if names & _REQUEST_ERROR_TYPES:
+        # A recognised request-level failure: only unambiguous status hints count.
+        if "401" in message or "unauthorized" in message or "invalid api key" in message:
+            return "auth"
+        if "429" in message or "rate limit" in message:
+            return "rate_limit"
+        return "internal"
+
+    # Unknown exception type (a wrapped provider error, a bare RuntimeError...):
+    # fall back to the message.
+    if "401" in message or "unauthorized" in message or "invalid api key" in message:
+        return "auth"
+    if "429" in message or "rate limit" in message:
+        return "rate_limit"
+    if "timed out" in message or "timeout" in message:
+        return "model_timeout"
+    if "connection" in message or "network" in message:
+        return "network"
+    return "internal"
+
+
+def _error_event(error: str, code: str, *, retriable: bool | None = None) -> dict:
+    return {
+        "type": "error",
+        "ok": False,
+        "error": error,
+        "code": code,
+        "retriable": bool(code in RETRIABLE_ERROR_CODES if retriable is None else retriable),
+    }
+
+
+def _exception_error_event(exc: BaseException, *, context: str = "stream") -> dict:
+    logger.exception("LangCode %s failed", context)
+    code = _classify_stream_error(exc)
+    return _error_event(f"{type(exc).__name__}: {exc}", code)
+
+
+def _notice_event(kind: str, message: str) -> dict:
+    return {"type": "notice", "kind": str(kind or "info"), "message": str(message or "")}
+
+
+def _usage_event(chunk: Any) -> dict | None:
+    usage = getattr(chunk, "usage_metadata", None)
+    if not isinstance(usage, dict) or not usage:
+        return None
+    input_tokens = int(usage.get("input_tokens") or 0)
+    output_tokens = int(usage.get("output_tokens") or 0)
+    total_tokens = int(usage.get("total_tokens") or (input_tokens + output_tokens))
+    if not (input_tokens or output_tokens or total_tokens):
+        return None
+    return {
+        "type": "usage",
+        "inputTokens": input_tokens,
+        "outputTokens": output_tokens,
+        "totalTokens": total_tokens,
+    }
+
+
+def _tool_result_preview_text(tool_result: Any) -> str:
+    if isinstance(tool_result, str):
+        return tool_result
+    if isinstance(tool_result, dict):
+        for key in ("content", "text", "output", "stdout", "summary", "result", "preview", "message"):
+            value = tool_result.get(key)
+            if isinstance(value, str) and value.strip():
+                return value
+        return json.dumps(_json_safe(tool_result), ensure_ascii=False)
+    return json.dumps(_json_safe(tool_result), ensure_ascii=False)
+
+
+def _tool_success_event(tool_name: str, tool_result: Any) -> dict | None:
+    if tool_name in INTERNAL_PREVIEW_TOOL_NAMES:
+        return None
+    if not _tool_result_succeeded(_json_safe(tool_result)):
+        return None
+    text = _tool_result_preview_text(_json_safe(tool_result))
+    truncated = len(text) > TOOL_RESULT_PREVIEW_CHARS
+    return {
+        "type": "tool_result",
+        "toolName": tool_name,
+        "ok": True,
+        "preview": text[:TOOL_RESULT_PREVIEW_CHARS],
+        "truncated": truncated,
+    }
+
+
+def _stream_tool_result_events(tool_name: str, tool_result: Any):
+    """Structured tool_result events for the ndjson stream (successes included)."""
+    tool_event = _tool_result_event(tool_name, tool_result)
+    if tool_event:
+        yield {"type": "tool_result", **tool_event}
+        return
+    success_event = _tool_success_event(tool_name, tool_result)
+    if success_event:
+        yield success_event
 
 
 def _agents_command_reply(threads: list[dict]) -> str:
@@ -2400,10 +3408,46 @@ def _prepare_tool_input(tool_name: str, tool_input: dict, session: WebSession) -
         if session.store_path is not None:
             prepared["_session_store_path"] = str(session.store_path)
         if tool_name == "self_evolve":
-            prepared["messages"] = _serialize_messages(session.messages)
+            # Never put the serialized history into the tool input: it travels
+            # through LangGraph state into checkpoints.sqlite. The reflection is
+            # re-run in-process from the live session instead (see
+            # _reflect_in_process), after the graph applied the approval gate.
+            prepared["session_id"] = session.id
             prepared["todos"] = list(session.todos)
         return prepared
     return tool_input
+
+
+def _is_self_evolve_reflect(tool_name: str, tool_input: dict) -> bool:
+    if tool_name != "self_evolve":
+        return False
+    action = str((tool_input or {}).get("action") or "status").strip().lower()
+    return action in {"reflect", "reflect_session"}
+
+
+def _reflect_in_process(session: WebSession, tool_input: dict) -> dict:
+    """Run self_evolve/reflect against the in-memory session history."""
+    return _json_safe(
+        reflect_session(
+            session.workspace_root,
+            session_id=session.id,
+            messages=_serialize_messages(session.messages),
+            todos=list(session.todos),
+            apply=bool((tool_input or {}).get("apply", True)),
+        )
+    )
+
+
+def _apply_self_evolve_result(session: WebSession, tool_name: str, tool_input: dict, tool_result: Any) -> Any:
+    if not _is_self_evolve_reflect(tool_name, tool_input):
+        return tool_result
+    if isinstance(tool_result, dict) and tool_result.get("ok") is False:
+        return tool_result
+    try:
+        return _reflect_in_process(session, tool_input)
+    except Exception as exc:
+        logger.exception("self_evolve reflection failed")
+        return {"ok": False, "error": f"{type(exc).__name__}: {exc}", "error_type": type(exc).__name__}
 
 
 def _apply_task_tool_result(session: WebSession, tool_name: str, tool_input: dict, tool_result: Any) -> tuple[Any, bool]:
@@ -2459,12 +3503,193 @@ def _float_env(name: str, fallback: float) -> float:
         return fallback
 
 
+def _int_env(name: str, fallback: int, *, minimum: int = 1) -> int:
+    try:
+        value = int(str(os.getenv(name, str(fallback))).strip())
+    except (TypeError, ValueError):
+        value = fallback
+    return max(minimum, value)
+
+
+def _max_tool_rounds() -> int:
+    return _int_env("LANGCODE_MAX_TOOL_ROUNDS", DEFAULT_MAX_TOOL_ROUNDS)
+
+
+def _max_resident_sessions() -> int:
+    return _int_env("LANGCODE_MAX_RESIDENT_SESSIONS", DEFAULT_MAX_RESIDENT_SESSIONS)
+
+
+def _stream_idle_timeout_sec() -> float:
+    value = _float_env("LANGCODE_STREAM_IDLE_TIMEOUT_SEC", DEFAULT_STREAM_IDLE_TIMEOUT_SEC)
+    return value if value > 0 else 0.0
+
+
+class _StreamIdleWatchdog:
+    """Flag a model stream that stops producing chunks (item 24).
+
+    A ``threading.Timer`` raises the flag from a background thread, so a stall
+    is caught while the streaming iterator is still blocked. ``beat()`` only
+    stores a timestamp - the timer reschedules itself for the remaining time
+    instead of being recreated per chunk, so a fast stream costs no extra
+    threads. The caller turns the flag into a retriable ``model_timeout``.
+    """
+
+    __slots__ = ("timeout", "session_id", "timed_out", "_timer", "_lock", "_done", "_last_beat", "_stream")
+
+    def __init__(self, timeout: float, session_id: str = "") -> None:
+        self.timeout = float(timeout or 0.0)
+        self.session_id = session_id
+        self.timed_out = False
+        self._timer: threading.Timer | None = None
+        self._lock = threading.Lock()
+        self._done = False
+        self._last_beat = time.monotonic()
+        self._stream: Any | None = None
+
+    def attach(self, stream: Any) -> None:
+        """Remember the model iterator so a stall can try to unblock it (item 11).
+
+        ``close()`` on the generator returned by ``model.stream(...)`` raises
+        GeneratorExit inside it, which usually frees a consumer parked on the
+        next chunk. It is strictly best effort: a generator that is *currently
+        executing* refuses to close, and a fully hung socket is only bounded by
+        the model client's own ``timeout`` setting.
+        """
+        with self._lock:
+            self._stream = stream
+
+    def _close_stream(self) -> None:
+        with self._lock:
+            stream = self._stream
+            self._stream = None
+        if stream is None:
+            return
+        closer = getattr(stream, "close", None)
+        if not callable(closer):
+            return
+        try:
+            closer()
+        except Exception:
+            logger.debug("Could not close the stalled model stream (session=%s)", self.session_id, exc_info=True)
+
+    def start(self) -> None:
+        self._last_beat = time.monotonic()
+        self._schedule(self.timeout)
+
+    def beat(self) -> None:
+        """Record a chunk. Cheap on purpose: called once per streamed token."""
+        self._last_beat = time.monotonic()
+
+    def cancel(self) -> None:
+        with self._lock:
+            self._done = True
+            timer, self._timer = self._timer, None
+            self._stream = None
+        if timer is not None:
+            timer.cancel()
+
+    def _schedule(self, delay: float) -> None:
+        with self._lock:
+            if self._done or self.timeout <= 0 or self.timed_out:
+                return
+            timer = threading.Timer(max(0.0, delay), self._check)
+            timer.daemon = True
+            self._timer = timer
+        timer.start()
+
+    def _check(self) -> None:
+        remaining = self.timeout - (time.monotonic() - self._last_beat)
+        if remaining > 0:
+            # A chunk arrived after this timer was armed: wait out the rest.
+            self._schedule(remaining)
+            return
+        with self._lock:
+            if self._done:
+                return
+            self.timed_out = True
+        logger.warning(
+            "LangCode model stream idle for more than %ss (session=%s)", self.timeout, self.session_id
+        )
+        # The consumer only notices the flag when a further chunk arrives, which
+        # is exactly what a stalled stream never sends - so try to break it.
+        self._close_stream()
+
+
+def _tool_round_limit_reminder() -> HumanMessage:
+    return HumanMessage(content=TOOL_ROUND_LIMIT_MOCK_USER)
+
+
 def _auto_reflect_enabled() -> bool:
     raw = os.getenv("LANGCODE_AUTO_REFLECT", "1").strip().lower()
     return raw not in {"0", "false", "no", "off"}
 
 
-async def _static_response(web_app: WebApp, requested: str):
+GZIP_ASSET_SUFFIXES = {".js", ".mjs", ".cjs", ".css", ".svg", ".json", ".html", ".map", ".txt", ".xml"}
+GZIP_MIN_BYTES = 1024
+_GZIP_CACHE: dict[tuple[str, int, int], bytes] = {}
+_GZIP_CACHE_LOCK = threading.Lock()
+_GZIP_CACHE_MAX_ENTRIES = 64
+# Item 9: index.html was re-read, token-substituted and gzipped on every single
+# request. Cache the rendered HTML plus its gzip body, keyed by file identity and
+# token so a rebuilt frontend or a restarted app never serves a stale page.
+_INDEX_CACHE: dict[tuple[str, int, int, str], tuple[str, bytes]] = {}
+_INDEX_CACHE_LOCK = threading.Lock()
+
+
+def _rendered_index(path: Path, stat: os.stat_result, token: str) -> tuple[str, bytes]:
+    """Return ``(html, gzipped_bytes)`` for index.html, from cache when possible."""
+    key = (str(path), stat.st_mtime_ns, stat.st_size, token)
+    with _INDEX_CACHE_LOCK:
+        cached = _INDEX_CACHE.get(key)
+    if cached is not None:
+        return cached
+    html = path.read_text(encoding="utf-8").replace("__LANGCODE_TOKEN__", token)
+    body = html.encode("utf-8")
+    compressed = gzip.compress(body, 6) if len(body) >= GZIP_MIN_BYTES else b""
+    entry = (html, compressed)
+    with _INDEX_CACHE_LOCK:
+        if len(_INDEX_CACHE) >= _GZIP_CACHE_MAX_ENTRIES:
+            _INDEX_CACHE.clear()
+        _INDEX_CACHE[key] = entry
+    return entry
+
+
+def _accepts_gzip(request: Request | None) -> bool:
+    if request is None:
+        return False
+    return "gzip" in str(request.headers.get("accept-encoding") or "").lower()
+
+
+def _is_gzippable_asset(path: Path) -> bool:
+    return path.suffix.lower() in GZIP_ASSET_SUFFIXES
+
+
+def _gzip_cached(path: Path, stat: os.stat_result) -> bytes:
+    key = (str(path), stat.st_mtime_ns, stat.st_size)
+    with _GZIP_CACHE_LOCK:
+        cached = _GZIP_CACHE.get(key)
+    if cached is not None:
+        return cached
+    compressed = gzip.compress(path.read_bytes(), 6)
+    with _GZIP_CACHE_LOCK:
+        if len(_GZIP_CACHE) >= _GZIP_CACHE_MAX_ENTRIES:
+            _GZIP_CACHE.clear()
+        _GZIP_CACHE[key] = compressed
+    return compressed
+
+
+def _apply_static_headers(resp, headers: dict[str, str]):
+    """Force exactly one value per header (Sanic's file() adds its own Cache-Control)."""
+    for name, value in headers.items():
+        try:
+            del resp.headers[name]
+        except KeyError:
+            pass
+        resp.headers[name] = value
+    return resp
+
+
+async def _static_response(web_app: WebApp, requested: str, request: Request | None = None):
     frontend_root = web_app.frontend_dir.resolve()
     candidate = (frontend_root / (requested.lstrip("/") or "index.html")).resolve()
     if candidate.is_dir():
@@ -2473,10 +3698,62 @@ async def _static_response(web_app: WebApp, requested: str):
         candidate = frontend_root / "index.html"
     if not candidate.exists():
         candidate = frontend_root / "index.html"
-    return await response.file(candidate)
+    cache_control = (
+        "public, max-age=31536000, immutable"
+        if candidate.parent.name == "assets" and candidate.name != "index.html"
+        else "no-cache"
+    )
+    stat = candidate.stat()
+    etag = f'"{stat.st_mtime_ns:x}-{stat.st_size:x}"'
+    headers = {"Cache-Control": cache_control, "ETag": etag, "Vary": "Accept-Encoding"}
+    if request is not None and request.headers.get("if-none-match") == etag:
+        return _apply_static_headers(response.empty(status=304), headers)
+    wants_gzip = _accepts_gzip(request)
+    if candidate.name == "index.html":
+        html, compressed = _rendered_index(candidate, stat, web_app.api_token)
+        if wants_gzip and compressed:
+            resp = response.raw(compressed, content_type="text/html; charset=utf-8")
+            return _apply_static_headers(resp, {**headers, "Content-Encoding": "gzip"})
+        return _apply_static_headers(response.html(html), headers)
+    served = candidate
+    encoding = ""
+    accepted = request.headers.get("accept-encoding", "") if request is not None else ""
+    if "br" in accepted and candidate.with_name(candidate.name + ".br").exists():
+        served = candidate.with_name(candidate.name + ".br")
+        encoding = "br"
+    elif "gzip" in accepted and candidate.with_name(candidate.name + ".gz").exists():
+        served = candidate.with_name(candidate.name + ".gz")
+        encoding = "gzip"
+    mime_type = mimetypes.guess_type(candidate.name)[0]
+    if not encoding and wants_gzip and _is_gzippable_asset(candidate) and stat.st_size >= GZIP_MIN_BYTES:
+        resp = response.raw(_gzip_cached(candidate, stat), content_type=mime_type or "application/octet-stream")
+        return _apply_static_headers(resp, {**headers, "Content-Encoding": "gzip"})
+    resp = await response.file(served, mime_type=mime_type)
+    if encoding:
+        headers = {**headers, "Content-Encoding": encoding}
+    return _apply_static_headers(resp, headers)
+
+
+def _configure_logging() -> None:
+    """Make ``langcode.*`` INFO lines visible without touching third-party loggers.
+
+    Sanic only configures its own loggers, so the project's ``logger.info``
+    calls (TTS first-audio latency, cancelled turns, ...) were silently dropped
+    and only WARNING+ reached stderr through logging's last-resort handler.
+    ``LANGCODE_LOG_LEVEL`` overrides the level (e.g. DEBUG for per-segment TTS).
+    """
+    level_name = (os.getenv("LANGCODE_LOG_LEVEL") or "INFO").strip().upper()
+    level = getattr(logging, level_name, logging.INFO)
+    project_logger = logging.getLogger("langcode")
+    project_logger.setLevel(level)
+    if not project_logger.handlers and not logging.getLogger().handlers:
+        handler = logging.StreamHandler()
+        handler.setFormatter(logging.Formatter("%(asctime)s %(levelname)s %(name)s: %(message)s"))
+        project_logger.addHandler(handler)
 
 
 def main(argv: list[str] | None = None) -> int:
+    _configure_logging()
     parser = argparse.ArgumentParser(description="Run the LangCode web app")
     parser.add_argument("--workspace", default=".", help="Workspace root")
     parser.add_argument("--host", default="127.0.0.1", help="Host")
@@ -2488,16 +3765,43 @@ def main(argv: list[str] | None = None) -> int:
         default=1,
         help="Sanic worker processes. Redis coordinates runtime state when available; keep 1 for local ASR/TTS efficiency.",
     )
+    parser.add_argument(
+        "--no-voice",
+        dest="enable_voice",
+        action="store_false",
+        default=None,
+        help=(
+            "Start without local ASR/TTS/turn-detection models. Required on a core-only "
+            "install (pip install -e . without the [voice] extra). Equivalent to "
+            "LANGCODE_VOICE=0. A remote LANGCODE_VOICE_WORKER_URL still works."
+        ),
+    )
     args = parser.parse_args(argv)
+
+    # LANGCODE_VOICE mirrors the flag so scripts/start_macos.sh can hand the
+    # server the same switch it used to choose the pip extra.
+    enable_voice = args.enable_voice
+    if enable_voice is None:
+        enable_voice = (os.getenv("LANGCODE_VOICE") or "1").strip().lower() not in ("0", "false", "no", "off")
 
     frontend_dir = Path(args.frontend_dir).expanduser().resolve()
     if not frontend_dir.exists():
         raise SystemExit(f"Frontend build not found: {frontend_dir}. Run npm run build first.")
 
-    app = WebApp(Path(args.workspace), frontend_dir)
+    app = WebApp(Path(args.workspace), frontend_dir, enable_voice=enable_voice)
+    if args.workers > 1 and not app.runtime_state.redis_available:
+        raise SystemExit(
+            "--workers > 1 requires Redis for cross-process session state, but Redis is unavailable: "
+            f"{app.runtime_state.status().get('error') or 'unknown error'}. "
+            "Start Redis (or set LANGCODE_REDIS_URL) and retry, or run with --workers 1."
+        )
     sanic_app = create_sanic_app(app)
     print(f"LangCode async web app: http://{args.host}:{args.port}")
     print(f"Workspace: {Path(args.workspace).expanduser().resolve()}")
+    if not enable_voice:
+        print("Voice: disabled (--no-voice / LANGCODE_VOICE=0); no local ASR/TTS models are loaded.")
+    elif app.voice_worker is not None:
+        print("Voice: remote worker (LANGCODE_VOICE_WORKER_URL); no local ASR/TTS models are loaded.")
     sanic_app.run(
         host=args.host,
         port=args.port,

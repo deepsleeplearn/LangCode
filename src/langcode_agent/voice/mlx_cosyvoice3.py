@@ -138,7 +138,14 @@ class MlxCosyVoice3Service:
         sample = self.samples_dir / f"{voice_id}.wav"
         return sample if sample.exists() else None
 
-    def synthesize(self, text: str, voice_id: str) -> tuple[bytes, str]:
+    def synthesize_samples(self, text: str, voice_id: str) -> tuple[np.ndarray, int]:
+        """Synthesize one segment and return the raw float32 samples.
+
+        The worker already produces a float32 array; callers that post-process
+        the waveform (silence trimming) should use this instead of
+        ``synthesize`` so the audio is not encoded to WAV just to be decoded
+        again.
+        """
         text = " ".join(str(text or "").split())
         if not text:
             raise ValueError("TTS 文本为空")
@@ -151,7 +158,11 @@ class MlxCosyVoice3Service:
             raise TimeoutError("MLX CosyVoice3 合成超时") from exc
         if not result.get("ok"):
             raise RuntimeError(str(result.get("error") or "MLX CosyVoice3 合成失败"))
-        return _wav_bytes(result["audio"], int(result["sample_rate"])), "audio/wav"
+        return np.asarray(result["audio"], dtype=np.float32), int(result["sample_rate"])
+
+    def synthesize(self, text: str, voice_id: str) -> tuple[bytes, str]:
+        audio, sample_rate = self.synthesize_samples(text, voice_id)
+        return _wav_bytes(audio, sample_rate), "audio/wav"
 
     def prepare_assets(self, *, generate_previews: bool = True) -> dict[str, Any]:
         """Prepare profiles and optional preview wavs in the current thread."""

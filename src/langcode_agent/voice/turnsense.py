@@ -56,6 +56,7 @@ class TurnSenseService:
             backend=self.settings.backend,
         )
         self._lock = threading.RLock()
+        self._infer_lock = threading.Lock()
         self._model: Any | None = None
         self._load_attempted = False
 
@@ -70,14 +71,36 @@ class TurnSenseService:
                 "error": self._status.error,
             }
 
-    def classify(self, *, text: str, audio: np.ndarray | None = None, sample_rate: int = 16000) -> dict[str, Any]:
+    def classify(
+        self,
+        *,
+        text: str,
+        audio: np.ndarray | None = None,
+        sample_rate: int = 16000,
+        audio_offset: int | None = None,
+        audio_stream: str = "",
+    ) -> dict[str, Any]:
+        """Classify one turn.
+
+        ``audio_offset``/``audio_stream`` are optional: when the caller passes a
+        rolling window plus the absolute index of its first sample (and a stable
+        stream id), the fbank frontend feeds only the newly arrived samples into
+        a persistent ``OnlineFbank`` instead of recomputing the whole window.
+        """
         text = (text or "").strip()
         if not self.settings.enabled:
             return _result("unknown", 0.0, "disabled")
         model = self._load_optional()
         if model is not None:
             try:
-                return model.classify(text=text, audio=audio, sample_rate=sample_rate)
+                with self._infer_lock:
+                    return model.classify(
+                        text=text,
+                        audio=audio,
+                        sample_rate=sample_rate,
+                        audio_offset=audio_offset,
+                        audio_stream=audio_stream,
+                    )
             except Exception as exc:
                 with self._lock:
                     self._status.state = "error"
@@ -122,7 +145,15 @@ class _OnnxTurnSense:
         self.labels = labels
         self.frontend = _AudioFrontend()
 
-    def classify(self, *, text: str, audio: np.ndarray | None = None, sample_rate: int = 16000) -> dict[str, Any]:
+    def classify(
+        self,
+        *,
+        text: str,
+        audio: np.ndarray | None = None,
+        sample_rate: int = 16000,
+        audio_offset: int | None = None,
+        audio_stream: str = "",
+    ) -> dict[str, Any]:
         if audio is None or audio.size == 0:
             return _result("unknown", 0.0, "onnx")
         waveform = _normalize_audio(audio)
@@ -130,8 +161,13 @@ class _OnnxTurnSense:
             raise ValueError(f"TurnSense 需要 {SAMPLE_RATE}Hz 音频，当前为 {sample_rate}Hz")
         if waveform.size == 0 or float(np.sqrt(np.mean(np.square(waveform)))) < 1e-5:
             return _result("invalid", 0.7, "turnsense")
-        waveform = waveform[-SAMPLE_RATE * MAX_AUDIO_SECONDS :]
-        feats, feat_len = self.frontend.extract_features(waveform)
+        if audio_offset is None:
+            waveform = waveform[-SAMPLE_RATE * MAX_AUDIO_SECONDS :]
+        elif waveform.size > SAMPLE_RATE * MAX_AUDIO_SECONDS:
+            dropped = waveform.size - SAMPLE_RATE * MAX_AUDIO_SECONDS
+            waveform = waveform[dropped:]
+            audio_offset += dropped
+        feats, feat_len = self.frontend.extract_features(waveform, offset=audio_offset, stream=audio_stream)
         outputs = self.session.run(
             None,
             {
@@ -193,17 +229,89 @@ class _AudioFrontend:
         self.opts = opts
         self.lfr_m = lfr_m
         self.lfr_n = lfr_n
+        # With snip_edges the last window must fit entirely inside the audio, so
+        # an 8s window holds (8000 - 25) // 10 + 1 = 798 frames, not 800. Keeping
+        # 800 made the incremental window two frames longer than a full recompute.
+        self._max_frames = max(1, (MAX_AUDIO_SECONDS * 1000 - frame_length) // max(1, frame_shift) + 1)
+        self._online: Any | None = None
+        self._stream = ""
+        self._fed_end = 0
+        self._next_frame = 0
+        self._popped = 0
+        self._frames: list[np.ndarray] = []
 
-    def extract_features(self, waveform: np.ndarray) -> tuple[np.ndarray, int]:
-        waveform = waveform.astype(np.float32, copy=False) * (1 << 15)
+    def reset(self, *, stream: str = "", offset: int = 0) -> None:
+        self._online = self._knf.OnlineFbank(self.opts)
+        self._stream = stream
+        self._fed_end = int(offset)
+        self._next_frame = 0
+        self._popped = 0
+        self._frames = []
+
+    def extract_features(
+        self,
+        waveform: np.ndarray,
+        *,
+        offset: int | None = None,
+        stream: str = "",
+    ) -> tuple[np.ndarray, int]:
+        """Compute LFR-stacked fbank features for ``waveform``.
+
+        When ``offset`` (the absolute index of ``waveform[0]`` inside a
+        continuous stream) is given, frames are computed incrementally with a
+        persistent ``OnlineFbank`` and a rolling frame window, so a partial that
+        adds 1s of audio costs 1s of fbank instead of the whole 8s window.
+        """
+        if offset is None:
+            return self._extract_stateless(waveform)
+        if (
+            self._online is None
+            or stream != self._stream
+            or offset > self._fed_end
+            or offset + int(waveform.size) < self._fed_end
+        ):
+            self.reset(stream=stream, offset=offset)
+        pending = waveform[self._fed_end - offset :]
+        if pending.size:
+            self._online.accept_waveform(
+                self.opts.frame_opts.samp_freq,
+                pending.astype(np.float32, copy=False) * (1 << 15),
+            )
+            self._fed_end += int(pending.size)
+        ready = int(self._online.num_frames_ready)
+        while self._next_frame < ready:
+            # get_frame() hands back a view over recycled internal memory, so the
+            # cached window must own its data before pop() releases the frames.
+            self._frames.append(np.array(self._online.get_frame(self._next_frame), dtype=np.float32, copy=True))
+            self._next_frame += 1
+        if len(self._frames) > self._max_frames:
+            self._frames = self._frames[-self._max_frames :]
+        drop = self._next_frame - self._popped
+        if drop > 0:
+            self._online.pop(drop)
+            self._popped += drop
+        if not self._frames:
+            return self._empty_features()
+        return self._stack(np.stack(self._frames))
+
+    def _extract_stateless(self, waveform: np.ndarray) -> tuple[np.ndarray, int]:
         fbank = self._knf.OnlineFbank(self.opts)
-        fbank.accept_waveform(self.opts.frame_opts.samp_freq, waveform.tolist())
-        frame_count = fbank.num_frames_ready
+        fbank.accept_waveform(
+            self.opts.frame_opts.samp_freq,
+            waveform.astype(np.float32, copy=False) * (1 << 15),
+        )
+        frame_count = int(fbank.num_frames_ready)
         if frame_count <= 0:
-            return np.zeros((1, self.opts.mel_opts.num_bins * self.lfr_m), dtype=np.float32), 1
+            return self._empty_features()
         feat = np.empty((frame_count, self.opts.mel_opts.num_bins), dtype=np.float32)
         for index in range(frame_count):
             feat[index, :] = fbank.get_frame(index)
+        return self._stack(feat)
+
+    def _empty_features(self) -> tuple[np.ndarray, int]:
+        return np.zeros((1, self.opts.mel_opts.num_bins * self.lfr_m), dtype=np.float32), 1
+
+    def _stack(self, feat: np.ndarray) -> tuple[np.ndarray, int]:
         feat = self._apply_lfr(feat, self.lfr_m, self.lfr_n)
         feat = np.nan_to_num(feat, nan=0.0, posinf=0.0, neginf=0.0)
         return feat.astype(np.float32, copy=False), int(feat.shape[0])

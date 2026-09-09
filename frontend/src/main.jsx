@@ -3,8 +3,7 @@ import { createPortal } from 'react-dom';
 import { createRoot } from 'react-dom/client';
 import ReactMarkdown from 'react-markdown';
 import remarkGfm from 'remark-gfm';
-import remarkMath from 'remark-math';
-import rehypeKatex from 'rehype-katex';
+import { diffLines } from 'diff';
 import {
   ArrowDown,
   Bot,
@@ -13,8 +12,11 @@ import {
   Check,
   CircleAlert,
   Code2,
+  Copy,
   Folder,
   AudioLines,
+  Monitor,
+  Moon,
   MoreHorizontal,
   MessageSquarePlus,
   PanelLeftClose,
@@ -24,37 +26,176 @@ import {
   Settings,
   SlidersHorizontal,
   Square,
+  Sun,
   Terminal,
   X,
 } from 'lucide-react';
 import './styles.css';
-import 'katex/dist/katex.min.css';
 
-const MERMAID_CONFIG = {
-  startOnLoad: false,
-  securityLevel: 'strict',
-  theme: 'base',
-  themeVariables: {
-    fontFamily: 'ui-sans-serif, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif',
-    primaryColor: '#f7f7f7',
-    primaryBorderColor: '#d1d1d1',
-    primaryTextColor: '#0d0d0d',
-    lineColor: '#8f8f8f',
-    secondaryColor: '#eef8f5',
-    tertiaryColor: '#ffffff',
-  },
-};
+const API_TOKEN = document.querySelector('meta[name="langcode-token"]')?.content || '';
+const API_HEADERS = { 'X-LangCode-Token': API_TOKEN };
+const DISPLAY_DELTA_FLUSH_MS = 64;
+const TOAST_TTL_MS = 6000;
+const TOAST_DEDUPE_MS = 5000;
+const TOAST_LIMIT = 5;
+// Two-stage barge-in: the backend VAD `speech start` only ducks, a confirmed intent stops.
+const TTS_DUCK_VOLUME = 0.2;
+const BARGE_IN_CONFIRM_WINDOW_MS = 1500;
+// Upper bound on holding the auto-end timer open for a `speech start` whose `end` never came.
+const VOICE_SPEECH_HOLD_MAX_MS = 8000;
+const TTS_PLAYED_AUDIO_KEY_LIMIT = 512;
+const VOICE_METRICS_TURN_LIMIT = 8;
+
+// Components rendered outside <App> (markdown code blocks) still need to report failures.
+let toastSink = null;
+let activeTranslations = null;
+
+function emitToast(payload) {
+  toastSink?.(payload);
+}
+
+const THEME_STORAGE_KEY = 'langcode-theme';
+const THEME_MODES = ['system', 'light', 'dark'];
+
+// Safari private mode and "block all cookies" make every localStorage access throw. An
+// unguarded read inside a useState initializer takes the whole page down, so every access
+// goes through these two helpers.
+function safeStorageGet(key, fallback = '') {
+  try {
+    const stored = localStorage.getItem(key);
+    return stored === null ? fallback : stored;
+  } catch {
+    return fallback;
+  }
+}
+
+function safeStorageSet(key, value) {
+  try {
+    if (value === null || value === undefined) localStorage.removeItem(key);
+    else localStorage.setItem(key, String(value));
+  } catch {
+    // Storage may be unavailable (private mode); the app still works for this tab.
+  }
+}
+
+function readStoredThemeMode() {
+  const stored = safeStorageGet(THEME_STORAGE_KEY, 'system');
+  return THEME_MODES.includes(stored) ? stored : 'system';
+}
+
+function writeStoredThemeMode(mode) {
+  safeStorageSet(THEME_STORAGE_KEY, mode);
+}
+
+function applyThemeAttribute(mode) {
+  const root = document.documentElement;
+  if (mode === 'light' || mode === 'dark') root.dataset.theme = mode;
+  else delete root.dataset.theme;
+}
+
+function systemPrefersDark() {
+  return Boolean(window.matchMedia?.('(prefers-color-scheme: dark)').matches);
+}
+
+function isEffectiveDark(mode) {
+  return mode === 'dark' || (mode !== 'light' && systemPrefersDark());
+}
+
+applyThemeAttribute(readStoredThemeMode());
+
+let effectiveDarkTheme = isEffectiveDark(readStoredThemeMode());
+const themeListeners = new Set();
+
+function subscribeThemeChange(listener) {
+  themeListeners.add(listener);
+  return () => themeListeners.delete(listener);
+}
+
+function publishThemeChange(nextDark) {
+  if (nextDark === effectiveDarkTheme) return;
+  effectiveDarkTheme = nextDark;
+  mermaidModulePromise = null;
+  mermaidThemeDark = null;
+  for (const listener of themeListeners) listener(nextDark);
+}
+
+const darkThemeMediaQuery = window.matchMedia?.('(prefers-color-scheme: dark)');
+darkThemeMediaQuery?.addEventListener?.('change', () => {
+  if (readStoredThemeMode() === 'system') publishThemeChange(systemPrefersDark());
+});
+
+function mermaidConfig(dark) {
+  return {
+    startOnLoad: false,
+    securityLevel: 'strict',
+    theme: dark ? 'dark' : 'base',
+    themeVariables: dark ? undefined : {
+      fontFamily: 'ui-sans-serif, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif',
+      primaryColor: '#f7f7f7',
+      primaryBorderColor: '#d1d1d1',
+      primaryTextColor: '#0d0d0d',
+      lineColor: '#8f8f8f',
+      secondaryColor: '#eef8f5',
+      tertiaryColor: '#ffffff',
+    },
+  };
+}
+
 let mermaidModulePromise = null;
+let mermaidThemeDark = null;
 
-function loadMermaid() {
-  if (!mermaidModulePromise) {
+function loadMermaid(dark = effectiveDarkTheme) {
+  if (!mermaidModulePromise || mermaidThemeDark !== dark) {
+    mermaidThemeDark = dark;
     mermaidModulePromise = import('mermaid').then((module) => {
       const instance = module.default;
-      instance.initialize(MERMAID_CONFIG);
+      instance.initialize(mermaidConfig(dark));
       return instance;
     });
   }
   return mermaidModulePromise;
+}
+
+const MATH_MARKUP_PATTERN = /\$|\\\(|\\\[/;
+const CODE_FENCE_PATTERN = /```/;
+const BASE_REMARK_PLUGINS = [remarkGfm];
+const EMPTY_REHYPE_PLUGINS = [];
+
+let mathPluginsCache = null;
+let mathPluginsPromise = null;
+let highlightPluginCache = null;
+let highlightPluginPromise = null;
+
+// A rejected import must not be cached: otherwise one flaky chunk fetch disables math or
+// highlighting for the rest of the page's life. Resetting the slot lets the next message retry.
+function loadMathPlugins() {
+  if (!mathPluginsPromise) {
+    mathPluginsPromise = import('./markdown-math.jsx')
+      .then((module) => {
+        mathPluginsCache = { remarkMath: module.remarkMath, rehypeKatex: module.rehypeKatex };
+        return mathPluginsCache;
+      })
+      .catch((err) => {
+        mathPluginsPromise = null;
+        throw err;
+      });
+  }
+  return mathPluginsPromise;
+}
+
+function loadHighlightPlugin() {
+  if (!highlightPluginPromise) {
+    highlightPluginPromise = import('./markdown-highlight.jsx')
+      .then((module) => {
+        highlightPluginCache = [module.rehypeHighlight, { ignoreMissing: true, detect: false }];
+        return highlightPluginCache;
+      })
+      .catch((err) => {
+        highlightPluginPromise = null;
+        throw err;
+      });
+  }
+  return highlightPluginPromise;
 }
 
 const MODEL_OPTIONS = [
@@ -252,17 +393,24 @@ const TRANSLATIONS = {
     slashCommandHint: 'Use arrow keys and Enter to select.',
     currentWorkspace: 'Current workspace',
     workspaceInputLabel: 'Workspace directory',
-    openDirectoryPicker: 'Choose workspace',
     nativePickerPrompt: 'Choose workspace directory',
-    directoryPickerTitle: 'Choose workspace directory',
-    parentDirectory: 'Parent',
-    homeDirectory: 'Home',
-    currentDirectory: 'Current',
-    selectedDirectory: 'Selected directory',
-    useThisDirectory: 'Use selected directory',
     close: 'Close',
-    loadingDirectories: 'Loading directories...',
-    noDirectories: 'No child directories',
+    retry: 'Retry',
+    theme: 'Theme',
+    themeSystem: 'Follow system',
+    themeLight: 'Light',
+    themeDark: 'Dark',
+    heartbeatWaiting: 'Model responding… {seconds}s',
+    usageLine: 'In {input} · Out {output}',
+    contextCompacted: 'Context compacted',
+    toolResultPreview: 'Tool output',
+    toolResultTruncated: '(truncated)',
+    sessionCompleted: 'Finished while you were away',
+    errorAuth: 'Check the API key configuration',
+    errorRateLimit: 'Rate limited, try again later',
+    errorModelTimeout: 'The model did not respond; you can retry',
+    errorContextOverflow: 'The session is too long — run /compact or start a new session',
+    errorNetwork: 'Network error',
     settings: 'Settings',
     model: 'Model',
     displayLanguage: 'Display language',
@@ -290,6 +438,10 @@ const TRANSLATIONS = {
     chinese: 'Chinese',
     saveSettings: 'Save',
     invalidApprovalJson: 'Edited tool input is invalid JSON: {error}',
+    copyFailed: 'Copy failed: {error}',
+    staleTokenReloadFailed:
+      'The server rejected this page (unauthorized). Reload the page; if it keeps failing, restart the server.',
+    diffTooLarge: 'Content too large, diff omitted (before {old} chars, after {new} chars).',
     requestFailed: 'Request failed',
     streamUnavailable: 'Streaming is not available in this browser.',
     streamFailed: 'Stream failed: {error}',
@@ -381,17 +533,24 @@ const TRANSLATIONS = {
     slashCommandHint: '可用方向键和回车选择。',
     currentWorkspace: '当前工作目录',
     workspaceInputLabel: '工作目录',
-    openDirectoryPicker: '选择工作目录',
     nativePickerPrompt: '选择工作目录',
-    directoryPickerTitle: '选择工作目录',
-    parentDirectory: '上级目录',
-    homeDirectory: '用户目录',
-    currentDirectory: '当前目录',
-    selectedDirectory: '已选择目录',
-    useThisDirectory: '使用所选目录',
     close: '关闭',
-    loadingDirectories: '正在加载目录...',
-    noDirectories: '没有子目录',
+    retry: '重试',
+    theme: '主题',
+    themeSystem: '跟随系统',
+    themeLight: '浅色',
+    themeDark: '深色',
+    heartbeatWaiting: '模型响应中… {seconds} 秒',
+    usageLine: '输入 {input} · 输出 {output}',
+    contextCompacted: '上下文已压缩',
+    toolResultPreview: '工具输出',
+    toolResultTruncated: '（已截断）',
+    sessionCompleted: '离开期间已完成',
+    errorAuth: '检查 API key 配置',
+    errorRateLimit: '稍后重试',
+    errorModelTimeout: '模型无响应，可重试',
+    errorContextOverflow: '会话过长，请 /compact 或新建会话',
+    errorNetwork: '网络错误',
     settings: '设置',
     model: '模型',
     displayLanguage: '显示语言',
@@ -419,6 +578,9 @@ const TRANSLATIONS = {
     chinese: '中文',
     saveSettings: '保存',
     invalidApprovalJson: '修改后的工具输入不是有效 JSON：{error}',
+    copyFailed: '复制失败：{error}',
+    staleTokenReloadFailed: '服务端拒绝了当前页面（未授权）。请刷新页面；如果仍然失败，请重启服务。',
+    diffTooLarge: '内容过大，已省略 diff（修改前 {old} 字符，修改后 {new} 字符）。',
     requestFailed: '请求失败',
     streamUnavailable: '当前浏览器不支持流式输出。',
     streamFailed: '流式请求失败：{error}',
@@ -443,22 +605,26 @@ function approvalProcessingText(approval, t, type) {
   return format(t.processingTool, { tool: toolName || 'tool' });
 }
 
+const LANGUAGE_STORAGE_KEY = 'langcode-language';
+const SIDEBAR_STORAGE_KEY = 'langcode-sidebar-collapsed';
+const TTS_VOICE_STORAGE_KEY = 'langcode-tts-voice-id';
+
 function getInitialLanguage() {
-  return localStorage.getItem('langcode-language') || 'zh';
+  return safeStorageGet(LANGUAGE_STORAGE_KEY, '') || 'zh';
 }
 
 function getInitialSidebarCollapsed() {
-  return localStorage.getItem('langcode-sidebar-collapsed') === 'true';
+  return safeStorageGet(SIDEBAR_STORAGE_KEY, '') === 'true';
 }
 
 const ACTIVE_SESSION_STORAGE_KEY = 'langcode-active-session-id';
 
 function getStoredActiveSessionId() {
-  return localStorage.getItem(ACTIVE_SESSION_STORAGE_KEY) || '';
+  return safeStorageGet(ACTIVE_SESSION_STORAGE_KEY, '') || '';
 }
 
 function getInitialTtsVoiceId() {
-  return localStorage.getItem('langcode-tts-voice-id') || 'default';
+  return safeStorageGet(TTS_VOICE_STORAGE_KEY, '') || 'default';
 }
 
 function getInitialActiveSessionId() {
@@ -566,16 +732,24 @@ function App() {
   const [pendingApproval, setPendingApproval] = useState(null);
   const [pendingApprovalAssistantId, setPendingApprovalAssistantId] = useState('');
   const [approvalProcessing, setApprovalProcessing] = useState(false);
-  const [agentProgress, setAgentProgress] = useState({ items: [], current: null, summary: '' });
-  const [todos, setTodos] = useState([]);
   const [error, setError] = useState('');
+  const [toasts, setToasts] = useState([]);
+  const [unreadSessions, setUnreadSessions] = useState({});
+  const [themeMode, setThemeMode] = useState(readStoredThemeMode);
   const [approvalEdit, setApprovalEdit] = useState('');
+  const lastUserTextRef = useRef('');
+  const approvalSectionRef = useRef(null);
+  const approvalEditError = useMemo(() => {
+    if (!pendingApproval || !approvalEdit.trim()) return '';
+    try {
+      JSON.parse(approvalEdit);
+      return '';
+    } catch (error) {
+      return error instanceof Error ? error.message : String(error);
+    }
+  }, [approvalEdit, pendingApproval]);
   const [workspaceInput, setWorkspaceInput] = useState('');
   const [selectedWorkspace, setSelectedWorkspace] = useState('');
-  const [directoryPickerOpen, setDirectoryPickerOpen] = useState(false);
-  const [directoryData, setDirectoryData] = useState(null);
-  const [directoryLoading, setDirectoryLoading] = useState(false);
-  const [directoryError, setDirectoryError] = useState('');
   const [modelInput, setModelInput] = useState('openai:glm-5:aimp-glm');
   const [thinkingEnabled, setThinkingEnabled] = useState(false);
   const [voiceModel, setVoiceModel] = useState('qwen3-asr-0.6b');
@@ -612,6 +786,7 @@ function App() {
   const voiceDraftUserIdRef = useRef('');
   const voiceSessionIdRef = useRef('');
   const voiceAutoFinishTimerRef = useRef(null);
+  const voiceFinishFallbackTimerRef = useRef(null);
   const voiceAutoFinishTextRef = useRef('');
   const voiceAutoFinishModeRef = useRef('');
   const voiceLastPartialTextRef = useRef('');
@@ -629,30 +804,46 @@ function App() {
   const ttsIncomingTextRef = useRef({});
   const ttsQueuedSpeechRef = useRef({});
   const ttsPlayedSpeechRef = useRef({});
+  const ttsPlayedAudioKeysRef = useRef(new Set());
   const ttsSpeechSequenceRef = useRef({});
   const ttsDelayedDisplayRef = useRef({});
   const ttsBargeInTokenRef = useRef('');
   const ttsSuppressedTokensRef = useRef(new Set());
+  const ttsDuckedRef = useRef(false);
+  const ttsDuckedPositionRef = useRef(0);
+  const ttsPlaybackEndedAtRef = useRef(0);
+  const voiceSpeechActiveRef = useRef(false);
+  const voiceSpeechStartedAtRef = useRef(0);
   const markdownDeltaBuffersRef = useRef({});
+  const displayDeltaBuffersRef = useRef({});
+  const displayDeltaTimersRef = useRef({});
   const ttsVoiceIdRef = useRef(getInitialTtsVoiceId());
   const voiceActiveRef = useRef(false);
   const voiceConversationActiveRef = useRef(false);
   const voiceRestartTimerRef = useRef(null);
   const bargeInTriggeredRef = useRef(false);
   const bargeInContextRef = useRef(null);
+  const toastTimersRef = useRef({});
+  const ttsEnabledRef = useRef(true);
 
   const activeSessionBusy = Boolean(sessionId && runningSessions[sessionId]);
   const interactionBusy = busy || activeSessionBusy;
   const anySessionBusy = Object.keys(runningSessions).length > 0;
   const workspaceBusy = busy || anySessionBusy;
-  const visibleSessions = mergeSessions(sessionId, sessions, draftSessions);
-  const ttsVoiceOptions = normalizeTtsVoiceOptions(
-    status?.tts?.voices?.length
-      ? status.tts.voices
-      : [
-          { id: 'xuefen', name: '雪芬', style: '自定义音色', builtIn: true },
-          { id: 'wangju', name: '汪菊', style: '自定义音色', builtIn: true },
-        ],
+  const visibleSessions = useMemo(
+    () => mergeSessions(sessionId, sessions, draftSessions),
+    [draftSessions, sessionId, sessions],
+  );
+  const ttsVoiceOptions = useMemo(
+    () => normalizeTtsVoiceOptions(
+      status?.tts?.voices?.length
+        ? status.tts.voices
+        : [
+            { id: 'xuefen', name: '雪芬', style: '自定义音色', builtIn: true },
+            { id: 'wangju', name: '汪菊', style: '自定义音色', builtIn: true },
+          ],
+    ),
+    [status?.tts?.voices],
   );
   const workspaceGroups = useMemo(() => groupSessionsByWorkspace(visibleSessions), [visibleSessions]);
   const activeWorkspaceLabel = sessionId ? workspaceInput : '';
@@ -678,6 +869,17 @@ function App() {
   );
 
   useEffect(() => {
+    toastSink = pushToast;
+    return () => {
+      toastSink = null;
+    };
+  }, []);
+
+  useEffect(() => {
+    activeTranslations = t;
+  }, [t]);
+
+  useEffect(() => {
     voiceActiveRef.current = voiceActive;
   }, [voiceActive]);
 
@@ -695,7 +897,7 @@ function App() {
 
   useEffect(() => {
     ttsVoiceIdRef.current = ttsVoiceId || 'default';
-    localStorage.setItem('langcode-tts-voice-id', ttsVoiceIdRef.current);
+    safeStorageSet(TTS_VOICE_STORAGE_KEY, ttsVoiceIdRef.current);
   }, [ttsVoiceId]);
 
   useEffect(() => {
@@ -706,6 +908,7 @@ function App() {
   }, [ttsVoiceOptions, ttsVoiceId]);
 
   useEffect(() => {
+    ttsEnabledRef.current = ttsEnabled;
     if (!ttsEnabled) stopTtsPlayback({ clearQueue: true, stopVoice: true, suppressCurrent: true });
   }, [ttsEnabled]);
 
@@ -717,16 +920,21 @@ function App() {
     void boot();
     return () => {
       stopVoiceCapture({ cancel: true, submit: false });
+      for (const token of Object.keys(displayDeltaTimersRef.current)) {
+        window.clearTimeout(displayDeltaTimersRef.current[token]);
+      }
+      displayDeltaTimersRef.current = {};
+      displayDeltaBuffersRef.current = {};
     };
   }, []);
 
   useEffect(() => {
     activeSessionRef.current = sessionId;
     if (sessionId) {
-      localStorage.setItem(ACTIVE_SESSION_STORAGE_KEY, sessionId);
+      safeStorageSet(ACTIVE_SESSION_STORAGE_KEY, sessionId);
       writeActiveSessionLocation(sessionId);
     } else {
-      localStorage.removeItem(ACTIVE_SESSION_STORAGE_KEY);
+      safeStorageSet(ACTIVE_SESSION_STORAGE_KEY, null);
       writeActiveSessionLocation('');
     }
   }, [sessionId]);
@@ -736,11 +944,84 @@ function App() {
   }, [messages]);
 
   useEffect(() => {
-    localStorage.setItem('langcode-language', language);
+    safeStorageSet(LANGUAGE_STORAGE_KEY, language);
   }, [language]);
 
   useEffect(() => {
-    localStorage.setItem('langcode-sidebar-collapsed', String(sidebarCollapsed));
+    if (!error) return undefined;
+    const timer = window.setTimeout(() => setError(''), 6000);
+    return () => window.clearTimeout(timer);
+  }, [error]);
+
+  useEffect(() => {
+    if (!voiceError) return undefined;
+    const timer = window.setTimeout(() => setVoiceError(''), 6000);
+    return () => window.clearTimeout(timer);
+  }, [voiceError]);
+
+  // One timer per toast id, keyed by id and never rebuilt: the previous version recreated
+  // every timer whenever the list changed, so a new toast silently extended the life of all
+  // the older ones.
+  useEffect(() => {
+    const alive = new Set(toasts.map((toast) => toast.id));
+    for (const id of Object.keys(toastTimersRef.current)) {
+      if (alive.has(id)) continue;
+      window.clearTimeout(toastTimersRef.current[id]);
+      delete toastTimersRef.current[id];
+    }
+    for (const toast of toasts) {
+      if (toast.fatal || toastTimersRef.current[toast.id]) continue;
+      const remaining = Math.max(0, TOAST_TTL_MS - (Date.now() - (toast.createdAt || Date.now())));
+      toastTimersRef.current[toast.id] = window.setTimeout(() => {
+        delete toastTimersRef.current[toast.id];
+        dismissToast(toast.id);
+      }, remaining);
+    }
+  }, [toasts]);
+
+  useEffect(
+    () => () => {
+      for (const timer of Object.values(toastTimersRef.current)) window.clearTimeout(timer);
+      toastTimersRef.current = {};
+    },
+    [],
+  );
+
+  function dismissToast(toastId) {
+    setToasts((current) => current.filter((toast) => toast.id !== toastId));
+  }
+
+  function pushToast({ message, tone = 'error', fatal = false, retry = null }) {
+    const text = String(message || '').trim();
+    if (!text) return;
+    const now = Date.now();
+    setToasts((current) => {
+      const duplicate = current.some(
+        (toast) => toast.tone === tone && toast.message === text && now - (toast.createdAt || 0) < TOAST_DEDUPE_MS,
+      );
+      if (duplicate) return current;
+      const next = [...current, { id: crypto.randomUUID(), message: text, tone, fatal, retry, createdAt: now }];
+      while (next.length > TOAST_LIMIT) {
+        // A fatal toast carries the failure the user still has to act on (retry); drop the
+        // oldest dismissible one instead, and keep everything when only fatals are left.
+        const evictable = next.findIndex((toast) => !toast.fatal);
+        if (evictable < 0) break;
+        next.splice(evictable, 1);
+      }
+      return next;
+    });
+  }
+
+  function applyThemeMode(mode) {
+    const nextMode = THEME_MODES.includes(mode) ? mode : 'system';
+    setThemeMode(nextMode);
+    writeStoredThemeMode(nextMode);
+    applyThemeAttribute(nextMode);
+    publishThemeChange(isEffectiveDark(nextMode));
+  }
+
+  useEffect(() => {
+    safeStorageSet(SIDEBAR_STORAGE_KEY, String(sidebarCollapsed));
     if (sidebarCollapsed) {
       setSessionMenu(null);
       setRenamingSessionId('');
@@ -751,6 +1032,14 @@ function App() {
     if (!stickToBottomRef.current) return;
     scrollToLatest({ behavior: 'auto' });
   }, [messages, pendingApproval]);
+
+  useEffect(() => {
+    if (!pendingApproval) return;
+    const active = document.activeElement;
+    const editing = active instanceof HTMLTextAreaElement || active instanceof HTMLInputElement;
+    if (editing) return;
+    approvalSectionRef.current?.focus({ preventScroll: true });
+  }, [pendingApproval]);
 
   useEffect(() => {
     resizeComposerTextarea();
@@ -812,7 +1101,7 @@ function App() {
         if (storedSessionId && loadedSessions.some((session) => session.id === storedSessionId)) {
           await openSession(storedSessionId);
         } else if (storedSessionId) {
-          localStorage.removeItem(ACTIVE_SESSION_STORAGE_KEY);
+          safeStorageSet(ACTIVE_SESSION_STORAGE_KEY, null);
           writeActiveSessionLocation('');
         }
       }
@@ -836,6 +1125,17 @@ function App() {
     delete streamControllersRef.current[targetSessionId];
     markSessionRunning(targetSessionId, false);
     return true;
+  }
+
+  // The rendered list is authoritative only for the active session; a background session's
+  // state lives in the live-message cache.
+  function sessionMessagesFor(targetSessionId) {
+    if (activeSessionRef.current === targetSessionId) return messagesRef.current;
+    return (
+      sessionLiveMessagesRef.current[targetSessionId] ||
+      activeRunsRef.current[targetSessionId]?.initialMessages ||
+      []
+    );
   }
 
   function updateSessionMessages(targetSessionId, updater) {
@@ -958,26 +1258,40 @@ function App() {
 
   async function submitMessage(
     rawText,
-    { clearInput = false, reuseUserMessageId = '', ignoreStaleRunning = false, voiceInterrupt = null } = {},
+    {
+      clearInput = false,
+      reuseUserMessageId = '',
+      ignoreStaleRunning = false,
+      voiceInterrupt = null,
+      targetSessionId = '',
+      dropAssistantMessageId = '',
+    } = {},
   ) {
     const text = String(rawText || '').trim();
-    const activeSessionId = sessionId;
+    const activeSessionId = targetSessionId || sessionId;
     if (!activeSessionId) {
       setError(t.chooseWorkspaceFirst);
       return;
     }
     if (!text || busy || activeRunsRef.current[activeSessionId] || (!ignoreStaleRunning && runningSessions[activeSessionId])) return;
+    lastUserTextRef.current = text;
     stickToBottomRef.current = true;
     setShowJumpToLatest(false);
     stopTtsPlayback({ clearQueue: true, stopVoice: !voiceConversationActiveRef.current, suppressCurrent: true });
     if (clearInput) setInput('');
     setSlashMenuOpen(false);
     setError('');
-    setAgentProgress({ items: [], current: null, summary: '' });
-    setTodos([]);
     const assistantId = crypto.randomUUID();
     const runId = crypto.randomUUID();
-    const visibleMessages = messagesRef.current;
+    const visibleMessages = sessionMessagesFor(activeSessionId).filter(
+      (message) =>
+        !(
+          dropAssistantMessageId &&
+          message.id === dropAssistantMessageId &&
+          message.role === 'assistant' &&
+          !String(message.content || '').trim()
+        ),
+    );
     const archivedMessages = archiveAssistantProgress(visibleMessages);
     const hasReusableUserMessage = Boolean(
       reuseUserMessageId && archivedMessages.some((message) => message.id === reuseUserMessageId && message.role === 'user'),
@@ -1004,9 +1318,10 @@ function App() {
         progressRunning: true,
       },
     ];
-    activeRunsRef.current[activeSessionId] = { runId, assistantId, userMessageId, controller: null, initialMessages };
+    activeRunsRef.current[activeSessionId] = { runId, assistantId, userMessageId, text, controller: null, initialMessages };
     sessionLiveMessagesRef.current[activeSessionId] = initialMessages;
     if (activeSessionRef.current === activeSessionId) {
+      messagesRef.current = initialMessages;
       setMessages(initialMessages);
     }
     markSessionRunning(activeSessionId, true);
@@ -1037,20 +1352,20 @@ function App() {
     void api('/api/session/cancel', { sessionId: activeSessionId, runId: activeRun.runId }).catch(() => {});
     activeRun.controller?.abort();
     streamControllersRef.current[activeSessionId]?.abort();
+    const cancelledAssistantId = activeRun.responseAssistantId || activeRun.assistantId;
     if (shouldDiscardInterruptedRun(messagesRef.current, activeRun)) {
+      if (cancelledAssistantId) clearMarkdownDeltaBuffer(activeSessionId, cancelledAssistantId, { flush: false });
       const nextMessages = messagesRef.current.filter(
         (message) => message.id !== activeRun.assistantId && message.id !== activeRun.userMessageId,
       );
       messagesRef.current = nextMessages;
       sessionLiveMessagesRef.current[activeSessionId] = nextMessages;
       setMessages(nextMessages);
-      setAgentProgress({ items: [], current: null, summary: '' });
-      setTodos([]);
       clearRunIfCurrent(activeSessionId, activeRun.runId);
       refreshSessions();
       return;
     }
-    setAgentProgress((current) => finishAgentProgress(current, t));
+    if (cancelledAssistantId) clearMarkdownDeltaBuffer(activeSessionId, cancelledAssistantId);
     updateLatestAssistantProgress((current) => finishAgentProgress(current, t));
     const assistantId = activeRun.assistantId || findLastAssistantId(messages);
     if (assistantId) setAssistantProgressRunning(assistantId, false);
@@ -1092,8 +1407,6 @@ function App() {
     setPendingApprovalAssistantId('');
     setApprovalProcessing(false);
     setApprovalEdit('');
-    setAgentProgress((current) => finishAgentProgress(current, t));
-    setTodos([]);
     setError('');
     setSlashMenuOpen(false);
     sessionLiveMessagesRef.current[activeSessionId] = (sessionLiveMessagesRef.current[activeSessionId] || messagesRef.current).map(
@@ -1135,8 +1448,13 @@ function App() {
       const currentToken = currentTtsToken();
       if (currentToken) tokensToSuppress.add(currentToken);
     }
-    for (const token of tokensToSuppress) ttsSuppressedTokensRef.current.add(token);
+    for (const token of tokensToSuppress) {
+      ttsSuppressedTokensRef.current.add(token);
+      requestTtsTurnCancel(token);
+      noteVoiceMetricsStop(token, 'stopped');
+    }
     clearVoiceTtsPreparingForStoppedTokens(tokensToSuppress);
+    restoreTtsPlaybackVolume();
     ttsPlayingRef.current = false;
     if (clearQueue) {
       ttsQueueRef.current = [];
@@ -1149,6 +1467,7 @@ function App() {
           delete ttsSpeechSequenceRef.current[token];
           delete ttsDelayedDisplayRef.current[token];
           delete markdownDeltaBuffersRef.current[token];
+          forgetTtsPlayedAudioKeys(token);
         }
       } else {
         ttsIncomingTextRef.current = {};
@@ -1157,6 +1476,7 @@ function App() {
         ttsSpeechSequenceRef.current = {};
         ttsDelayedDisplayRef.current = {};
         markdownDeltaBuffersRef.current = {};
+        ttsPlayedAudioKeysRef.current.clear();
       }
       ttsPlaybackTokenRef.current = '';
       ttsBargeInTokenRef.current = '';
@@ -1179,16 +1499,37 @@ function App() {
   }
 
   function queueAssistantTtsDelta(targetSessionId, assistantId, delta, { force = false, delayDisplay = false } = {}) {
+    // Every early return below means the text will never be spoken. With delayDisplay the
+    // caller handed us the only copy of the text, so it must be shown here, otherwise an
+    // approval mid-stream silently swallows the rest of the answer and the spinner hangs.
+    // Without delayDisplay the caller already displayed it, so re-displaying would duplicate.
+    const fallbackToDisplay = () => {
+      if (!targetSessionId || !assistantId) return;
+      if (delayDisplay) {
+        queueDisplayDelta(targetSessionId, assistantId, delta || '');
+        if (force) flushQueuedDisplayDelta(targetSessionId, assistantId, { flushMarkdown: true });
+      }
+      setAssistantVoiceTtsPreparing(targetSessionId, assistantId, false);
+    };
     if (
-      !ttsEnabled ||
+      !ttsEnabledRef.current ||
       !voiceConversationActiveRef.current ||
       !targetSessionId ||
       !assistantId ||
       activeSessionRef.current !== targetSessionId
-    ) return;
-    if (pendingApproval || sessionPendingApprovalsRef.current[targetSessionId]) return;
+    ) {
+      fallbackToDisplay();
+      return;
+    }
+    if (pendingApprovalRef.current || sessionPendingApprovalsRef.current[targetSessionId]) {
+      fallbackToDisplay();
+      return;
+    }
     const token = ttsToken(targetSessionId, assistantId);
-    if (ttsSuppressedTokensRef.current.has(token)) return;
+    if (ttsSuppressedTokensRef.current.has(token)) {
+      fallbackToDisplay();
+      return;
+    }
     if (ttsPlaybackTokenRef.current && ttsPlaybackTokenRef.current !== token) {
       stopTtsPlayback({ clearQueue: true, stopVoice: true, suppressCurrent: true });
     }
@@ -1197,12 +1538,22 @@ function App() {
     const selectedVoiceId = ttsVoiceIdRef.current || 'default';
     const useCustomVoice = selectedVoiceId !== 'default';
     const shouldDelayDisplay = Boolean(delayDisplay && useCustomVoice);
+    if (delayDisplay && !useCustomVoice) {
+      // The voice switched back to the built-in one mid-stream: the delayed-display queue
+      // will not carry this text, so show it now. It is still spoken below.
+      queueDisplayDelta(targetSessionId, assistantId, delta || '');
+      setAssistantVoiceTtsPreparing(targetSessionId, assistantId, false);
+    }
     if (shouldDelayDisplay && !ttsDelayedDisplayRef.current[token]) {
       ttsDelayedDisplayRef.current[token] = { released: false };
     }
     const incomingDelta = delta ? takeNovelTtsIncomingDelta(token, delta) : '';
     const current = `${ttsChunkBuffersRef.current[token] || ''}${incomingDelta}`;
-    const { chunks, remainder } = splitTtsText(current, { force, compact: useCustomVoice });
+    const { chunks, remainder } = splitTtsText(current, {
+      force,
+      compact: useCustomVoice,
+      first: !ttsSpeechSequenceRef.current[token],
+    });
     ttsChunkBuffersRef.current[token] = remainder;
     for (const chunk of chunks) {
       const text = dedupeTtsSpeechChunk(token, stripMarkdownForSpeech(chunk));
@@ -1213,9 +1564,15 @@ function App() {
       const normalizedText = normalizeTtsSpeechForDedupe(text);
       const liveMessages = sessionLiveMessagesRef.current[targetSessionId] || messagesRef.current;
       const previousUser = findPreviousUserMessage(liveMessages, assistantId);
+      const speechId = nextTtsSpeechId(token);
+      const queuedAt = Date.now();
+      recordVoiceMetric(token, 'queuedAt', queuedAt, { sessionId: targetSessionId });
       ttsQueueRef.current.push({
         type: 'speech',
-        speechId: nextTtsSpeechId(token),
+        speechId,
+        // The token is per assistant reply, so it doubles as the backend turn id and the
+        // sequence counter behind speechId gives the 0-based segment index.
+        segmentIndex: (ttsSpeechSequenceRef.current[token] || 1) - 1,
         token,
         sessionId: targetSessionId,
         assistantId,
@@ -1225,7 +1582,7 @@ function App() {
         normalizedText,
         displayText: shouldDelayDisplay ? chunk : '',
         delayDisplay: shouldDelayDisplay,
-        queuedAt: Date.now(),
+        queuedAt,
       });
     }
     if (force) {
@@ -1351,13 +1708,18 @@ function App() {
     };
   }
 
-  function shouldDelayCustomVoiceDisplay(targetSessionId) {
-    return Boolean(
-      ttsEnabled &&
-        voiceConversationActiveRef.current &&
-        activeSessionRef.current === targetSessionId &&
-        (ttsVoiceIdRef.current || 'default') !== 'default',
-    );
+  // Delaying display is only safe while TTS can actually consume the delta. Once the token
+  // is suppressed (an approval stopped playback) or the session is waiting for an approval,
+  // queueAssistantTtsDelta drops everything it is handed, so display must not be delayed.
+  function shouldDelayCustomVoiceDisplay(targetSessionId, assistantId = '') {
+    if (!ttsEnabledRef.current) return false;
+    if (!voiceConversationActiveRef.current) return false;
+    if (activeSessionRef.current !== targetSessionId) return false;
+    if ((ttsVoiceIdRef.current || 'default') === 'default') return false;
+    if (pendingApprovalRef.current || sessionPendingApprovalsRef.current[targetSessionId]) return false;
+    const token = assistantId ? ttsToken(targetSessionId, assistantId) : '';
+    if (token && ttsSuppressedTokensRef.current.has(token)) return false;
+    return true;
   }
 
   function setAssistantVoiceTtsPreparing(targetSessionId, assistantId, preparing) {
@@ -1440,8 +1802,51 @@ function App() {
     return takeMarkdownDisplayDelta(targetSessionId, assistantId, '', { flush: true });
   }
 
-  function clearMarkdownDeltaBuffer(targetSessionId, assistantId) {
-    delete markdownDeltaBuffersRef.current[markdownDeltaToken(targetSessionId, assistantId)];
+  function cancelDisplayDeltaTimer(token) {
+    const timer = displayDeltaTimersRef.current[token];
+    if (timer) window.clearTimeout(timer);
+    delete displayDeltaTimersRef.current[token];
+  }
+
+  function flushQueuedDisplayDelta(targetSessionId, assistantId, { flushMarkdown = false } = {}) {
+    const token = markdownDeltaToken(targetSessionId, assistantId);
+    cancelDisplayDeltaTimer(token);
+    const pending = displayDeltaBuffersRef.current[token] || '';
+    delete displayDeltaBuffersRef.current[token];
+    const value = takeMarkdownDisplayDelta(targetSessionId, assistantId, pending, { flush: flushMarkdown });
+    if (!value) return;
+    updateSessionMessages(targetSessionId, (current) =>
+      appendAssistantContentInMessages(current, assistantId, value),
+    );
+  }
+
+  // setTimeout instead of requestAnimationFrame: rAF is throttled to a stop in background
+  // tabs, which froze streaming text until the run finished.
+  function queueDisplayDelta(targetSessionId, assistantId, delta) {
+    if (!delta) return;
+    const token = markdownDeltaToken(targetSessionId, assistantId);
+    displayDeltaBuffersRef.current[token] = `${displayDeltaBuffersRef.current[token] || ''}${delta}`;
+    if (displayDeltaTimersRef.current[token]) return;
+    displayDeltaTimersRef.current[token] = window.setTimeout(() => {
+      delete displayDeltaTimersRef.current[token];
+      flushQueuedDisplayDelta(targetSessionId, assistantId);
+    }, DISPLAY_DELTA_FLUSH_MS);
+  }
+
+  function clearMarkdownDeltaBuffer(targetSessionId, assistantId, { flush = true } = {}) {
+    if (flush) flushQueuedDisplayDelta(targetSessionId, assistantId, { flushMarkdown: true });
+    const token = markdownDeltaToken(targetSessionId, assistantId);
+    cancelDisplayDeltaTimer(token);
+    delete displayDeltaBuffersRef.current[token];
+    delete markdownDeltaBuffersRef.current[token];
+  }
+
+  function flushActiveRunDisplayDelta(targetSessionId) {
+    if (!targetSessionId) return;
+    const activeRun = activeRunsRef.current[targetSessionId];
+    const assistantId = activeRun?.responseAssistantId || activeRun?.assistantId;
+    if (!assistantId) return;
+    flushQueuedDisplayDelta(targetSessionId, assistantId);
   }
 
   function ensureTtsBargeInListening(item) {
@@ -1480,15 +1885,7 @@ function App() {
     const inFlight = [];
     try {
       while (true) {
-        while (inFlight.length < ttsPrefetchWindow()) {
-          const nextItem = takeNextTtsQueueItem({ speechOnly: true });
-          if (!nextItem) break;
-          inFlight.push({
-            item: nextItem,
-            promise: prepareTtsStreamItem(nextItem),
-            prepared: null,
-          });
-        }
+        fillTtsInFlight(inFlight);
 
         if (inFlight.length > 0) {
           const first = inFlight[0];
@@ -1505,11 +1902,13 @@ function App() {
           }
           const next = inFlight.shift();
           const prepared = await prepareTtsEntry(next);
+          // Refill before awaiting playback so synthesis of N+1/N+2 overlaps playback of N.
+          fillTtsInFlight(inFlight);
           if (!isCurrentTtsSpeechItem(next.item)) {
             releasePreparedTts(prepared);
             continue;
           }
-          if (prepared.blobs.length === 0) {
+          if (prepared.audioItems.length === 0) {
             releaseDelayedDisplayOnTtsFailure(prepared.item);
             releasePreparedTts(prepared);
             continue;
@@ -1526,13 +1925,26 @@ function App() {
         }
       }
     } finally {
+      // The loop only exits with an empty list; on a thrown error the prefetched streams
+      // would otherwise keep their fetch and blob URLs alive.
+      for (const entry of inFlight) releasePreparedTts(entry.stream);
+      inFlight.length = 0;
       ttsPumpActiveRef.current = false;
       if (ttsQueueRef.current.length > 0) void pumpTtsQueue();
     }
   }
 
+  // Bounded by the prefetch window, so the in-flight list can never grow unbounded.
+  function fillTtsInFlight(inFlight) {
+    while (inFlight.length < ttsPrefetchWindow()) {
+      const nextItem = takeNextTtsQueueItem({ speechOnly: true });
+      if (!nextItem) return;
+      inFlight.push({ item: nextItem, stream: prepareTtsStreamItem(nextItem), prepared: null });
+    }
+  }
+
   async function prepareTtsEntry(entry) {
-    if (!entry.prepared) entry.prepared = await entry.promise;
+    if (!entry.prepared) entry.prepared = await waitForFirstTtsStreamAudio(entry.stream);
     return entry.prepared;
   }
 
@@ -1560,9 +1972,83 @@ function App() {
     return new Promise((resolve) => window.setTimeout(resolve, ms));
   }
 
+  // Latency instrumentation only: nothing here feeds the UI.
+  function voiceMetricsStore() {
+    if (!window.__langcodeVoiceMetrics) window.__langcodeVoiceMetrics = { turns: {}, order: [] };
+    return window.__langcodeVoiceMetrics;
+  }
+
+  function voiceMetricsTurn(turnId, sessionId = '') {
+    const store = voiceMetricsStore();
+    if (!store.turns[turnId]) {
+      store.turns[turnId] = {
+        turnId,
+        sessionId,
+        queuedAt: 0,
+        firstFetchAt: 0,
+        firstAudioAt: 0,
+        firstPlayAt: 0,
+        firstAudioMs: 0,
+        gapMs: [],
+        bargeInDetectedAt: 0,
+        playbackStoppedAt: 0,
+      };
+      store.order.push(turnId);
+      while (store.order.length > VOICE_METRICS_TURN_LIMIT) {
+        delete store.turns[store.order.shift()];
+      }
+    }
+    return store.turns[turnId];
+  }
+
+  function recordVoiceMetric(turnId, key, value, extra = {}) {
+    if (!turnId) return;
+    const turn = voiceMetricsTurn(turnId, extra.sessionId || '');
+    if (!turn[key]) turn[key] = value;
+    if (extra.firstAudioMs && !turn.firstAudioMs) turn.firstAudioMs = extra.firstAudioMs;
+  }
+
+  function recordTtsPlaybackStartMetrics(turnId, sessionId) {
+    if (!turnId) return;
+    const turn = voiceMetricsTurn(turnId, sessionId);
+    const now = Date.now();
+    if (!turn.firstPlayAt) turn.firstPlayAt = now;
+    else if (ttsPlaybackEndedAtRef.current) turn.gapMs.push(now - ttsPlaybackEndedAtRef.current);
+  }
+
+  // Only touches turns that actually reached the TTS queue, so the routine stop paths do not
+  // fabricate empty metric entries.
+  function noteVoiceMetricsStop(turnId, reason) {
+    const turn = voiceMetricsStore().turns[turnId];
+    if (!turn) return;
+    if (!turn.playbackStoppedAt) turn.playbackStoppedAt = Date.now();
+    flushVoiceMetrics(turnId, reason);
+  }
+
+  function flushVoiceMetrics(turnId, reason) {
+    if (!turnId) return;
+    const store = voiceMetricsStore();
+    const turn = store.turns[turnId];
+    if (!turn || turn.reported) return;
+    turn.reported = reason;
+    const since = (value) => (value && turn.queuedAt ? value - turn.queuedAt : 0);
+    console.debug('[voice]', {
+      turn: turnId,
+      reason,
+      queueToFetchMs: since(turn.firstFetchAt),
+      queueToFirstAudioMs: since(turn.firstAudioAt),
+      queueToFirstPlayMs: since(turn.firstPlayAt),
+      serverFirstAudioMs: turn.firstAudioMs,
+      gapMs: turn.gapMs,
+      duckedAtSec: turn.duckedAtSec || 0,
+      bargeInAfterMs: since(turn.bargeInDetectedAt),
+      stoppedAfterMs: since(turn.playbackStoppedAt),
+    });
+  }
+
   function ttsPrefetchWindow() {
     const voiceId = ttsVoiceIdRef.current || 'default';
-    return voiceId && voiceId !== 'default' ? 3 : 1;
+    return voiceId && voiceId !== 'default' ? 3 : 2;
   }
 
   async function finishTtsTokenIfIdle(item) {
@@ -1580,6 +2066,8 @@ function App() {
     delete ttsPlayedSpeechRef.current[item.token];
     delete ttsSpeechSequenceRef.current[item.token];
     delete markdownDeltaBuffersRef.current[item.token];
+    forgetTtsPlayedAudioKeys(item.token);
+    flushVoiceMetrics(item.token, 'completed');
     ttsPlaybackTokenRef.current = '';
     ttsBargeInTokenRef.current = '';
     if (voiceConversationActiveRef.current) {
@@ -1615,18 +2103,43 @@ function App() {
     return null;
   }
 
-  async function prepareTtsStreamItem(item) {
+  // Starts the synthesis request immediately and returns a live stream handle. Audio blobs are
+  // handed to the player as soon as their NDJSON line is parsed, so playback of the first chunk
+  // overlaps synthesis of the rest instead of waiting for the reader loop to end.
+  function prepareTtsStreamItem(item) {
     ensureTtsBargeInListening(item);
-    const controller = new AbortController();
+    const stream = {
+      item,
+      audioItems: [],
+      cursor: 0,
+      finished: false,
+      cancelled: false,
+      controller: new AbortController(),
+      waiters: [],
+    };
+    // Nothing awaits the reader loop: the player consumes the stream instead, so the promise
+    // needs its own catch to stay off the unhandled-rejection path.
+    stream.completion = runTtsStreamItem(stream).catch(() => finishTtsStream(stream));
+    return stream;
+  }
+
+  async function runTtsStreamItem(stream) {
+    const { item, controller } = stream;
     const timeoutMs = ttsSynthesisTimeoutMs(item.text, item.voiceId);
     const timeoutId = window.setTimeout(() => controller.abort(), timeoutMs);
     ttsCurrentAbortControllersRef.current.add(controller);
-    const blobs = [];
+    recordVoiceMetric(item.token, 'firstFetchAt', Date.now(), { sessionId: item.sessionId });
     try {
       const response = await fetch('/api/tts/stream', {
         method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ text: item.text, voiceId: item.voiceId || 'default' }),
+        headers: { ...API_HEADERS, 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          text: item.text,
+          voiceId: item.voiceId || 'default',
+          sessionId: item.sessionId,
+          turnId: item.token,
+          segmentIndex: item.segmentIndex ?? 0,
+        }),
         signal: controller.signal,
       });
       if (!response.ok) {
@@ -1634,12 +2147,11 @@ function App() {
         if (activeSessionRef.current === item.sessionId) {
           setVoiceError(format(t.voiceUnavailable, { error: detail || `${response.status} ${response.statusText}` }));
         }
-        return { item, blobs };
+        return;
       }
       if (!response.body) {
-        const blob = await response.blob();
-        blobs.push(blob);
-        return { item, blobs };
+        pushTtsStreamAudio(stream, await response.blob(), {});
+        return;
       }
       const reader = response.body.getReader();
       const decoder = new TextDecoder();
@@ -1651,14 +2163,10 @@ function App() {
         const lines = buffer.split('\n');
         buffer = lines.pop() || '';
         for (const line of lines) {
-          const blob = decodeTtsStreamLine(line, item);
-          if (blob) blobs.push(blob);
+          if (consumeTtsStreamLine(stream, line)) return;
         }
       }
-      if (buffer.trim()) {
-        const blob = decodeTtsStreamLine(buffer, item);
-        if (blob) blobs.push(blob);
-      }
+      if (buffer.trim()) consumeTtsStreamLine(stream, buffer);
     } catch (err) {
       if (err.name !== 'AbortError') {
         if (activeSessionRef.current === item.sessionId) {
@@ -1668,8 +2176,78 @@ function App() {
     } finally {
       window.clearTimeout(timeoutId);
       ttsCurrentAbortControllersRef.current.delete(controller);
+      finishTtsStream(stream);
     }
-    return { item, blobs, audioItems: blobs.map(createPreparedTtsAudio) };
+  }
+
+  // Returns true when the stream is terminated by the event (a `cancelled` notice ends the
+  // response, and it must not raise an error toast).
+  function consumeTtsStreamLine(stream, line) {
+    const payload = decodeTtsStreamLine(line, stream.item);
+    if (!payload) return false;
+    if (payload.type === 'cancelled') {
+      stream.cancelled = true;
+      return true;
+    }
+    if (payload.type !== 'audio' || !payload.audio) return false;
+    if (!claimTtsStreamAudioKey(stream.item, payload.seq)) return false;
+    pushTtsStreamAudio(stream, base64AudioBlob(payload.audio, payload.contentType || 'audio/wav'), payload);
+    return false;
+  }
+
+  function pushTtsStreamAudio(stream, blob, payload) {
+    if (!blob) return;
+    if (stream.audioItems.length === 0) {
+      recordVoiceMetric(stream.item.token, 'firstAudioAt', Date.now(), {
+        sessionId: stream.item.sessionId,
+        firstAudioMs: Number(payload?.firstAudioMs) || 0,
+      });
+    }
+    stream.audioItems.push(createPreparedTtsAudio(blob));
+    wakeTtsStreamWaiters(stream);
+  }
+
+  function finishTtsStream(stream) {
+    if (stream.finished) return;
+    stream.finished = true;
+    wakeTtsStreamWaiters(stream);
+  }
+
+  function wakeTtsStreamWaiters(stream) {
+    const waiters = stream.waiters;
+    stream.waiters = [];
+    for (const resolve of waiters) resolve();
+  }
+
+  // Resolves once the first audio blob has landed, or the stream ended without one. The pump
+  // uses it as the "prepared" checkpoint, so a segment is considered ready at first audio.
+  async function waitForFirstTtsStreamAudio(stream) {
+    while (stream.audioItems.length === 0 && !stream.finished) {
+      await new Promise((resolve) => stream.waiters.push(resolve));
+    }
+    return stream;
+  }
+
+  async function takeNextTtsStreamAudio(stream) {
+    while (stream.cursor >= stream.audioItems.length) {
+      if (stream.finished) return null;
+      await new Promise((resolve) => stream.waiters.push(resolve));
+    }
+    const audioItem = stream.audioItems[stream.cursor];
+    stream.cursor += 1;
+    return audioItem;
+  }
+
+  // Dedupes played audio by (turnId, segmentIndex, seq) so a replayed or retried NDJSON event
+  // can never speak the same fragment twice.
+  function claimTtsStreamAudioKey(item, seq) {
+    if (seq === undefined || seq === null) return true;
+    const key = `${item.token}|${item.segmentIndex ?? 0}|${seq}`;
+    const played = ttsPlayedAudioKeysRef.current;
+    if (played.has(key)) return false;
+    if (played.size >= TTS_PLAYED_AUDIO_KEY_LIMIT) played.clear();
+    played.add(key);
+    return true;
   }
 
   function createPreparedTtsAudio(blob) {
@@ -1693,8 +2271,7 @@ function App() {
       }
       return null;
     }
-    if (payload.type !== 'audio' || !payload.audio) return null;
-    return base64AudioBlob(payload.audio, payload.contentType || 'audio/wav');
+    return payload;
   }
 
   async function playPreparedTtsItem(prepared) {
@@ -1705,11 +2282,16 @@ function App() {
     if (prepared.item.delayDisplay) {
       appendDelayedAssistantContent(prepared.item.sessionId, prepared.item.assistantId, prepared.item.displayText || prepared.item.text);
     }
-    const audioItems = prepared.audioItems?.length ? prepared.audioItems : prepared.blobs.map(createPreparedTtsAudio);
-    for (const audioItem of audioItems) {
-      if (!isCurrentTtsSpeechItem(prepared.item)) return;
+    while (isCurrentTtsSpeechItem(prepared.item)) {
+      const audioItem = await takeNextTtsStreamAudio(prepared);
+      if (!audioItem) break;
+      if (!isCurrentTtsSpeechItem(prepared.item)) {
+        releasePreparedTtsAudio(audioItem);
+        break;
+      }
       await playPreparedTtsAudio(audioItem, prepared.item);
     }
+    releasePreparedTts(prepared);
   }
 
   function releaseDelayedDisplayOnTtsFailure(item) {
@@ -1741,13 +2323,17 @@ function App() {
       return;
     }
     ensureTtsBargeInListening(item);
+    recordTtsPlaybackStartMetrics(item.token, item.sessionId);
     await new Promise((resolve) => {
       const { audio, url } = audioItem;
       ttsObjectUrlRef.current = url;
       ttsAudioRef.current = audio;
       ttsPlayingRef.current = true;
+      // A duck decided between two chunks must carry over to the element that starts next.
+      audio.volume = ttsDuckedRef.current ? TTS_DUCK_VOLUME : 1;
       const finish = () => {
         if (ttsAudioResolveRef.current === finish) ttsAudioResolveRef.current = null;
+        ttsPlaybackEndedAtRef.current = Date.now();
         if (ttsAudioRef.current === audio) {
           ttsPlayingRef.current = false;
           stopCurrentTtsAudio();
@@ -1774,9 +2360,17 @@ function App() {
   }
 
   function releasePreparedTts(prepared) {
-    for (const audioItem of prepared?.audioItems || []) {
-      releasePreparedTtsAudio(audioItem);
+    if (!prepared) return;
+    try {
+      prepared.controller?.abort();
+    } catch {
+      // The controller may already be closed by the fetch path.
     }
+    // Everything before the cursor already played and released itself.
+    for (let index = prepared.cursor || 0; index < (prepared.audioItems?.length || 0); index += 1) {
+      releasePreparedTtsAudio(prepared.audioItems[index]);
+    }
+    prepared.cursor = prepared.audioItems?.length || 0;
   }
 
   function releasePreparedTtsAudio(audioItem) {
@@ -1793,6 +2387,7 @@ function App() {
   function suppressTtsToken(token) {
     if (!token) return;
     ttsSuppressedTokensRef.current.add(token);
+    requestTtsTurnCancel(token);
     ttsQueueRef.current = ttsQueueRef.current.filter((item) => item.token !== token);
     delete ttsChunkBuffersRef.current[token];
     delete ttsIncomingTextRef.current[token];
@@ -1800,10 +2395,66 @@ function App() {
     delete ttsPlayedSpeechRef.current[token];
     delete ttsSpeechSequenceRef.current[token];
     delete ttsDelayedDisplayRef.current[token];
+    forgetTtsPlayedAudioKeys(token);
     if (ttsPlaybackTokenRef.current === token) {
       ttsPlaybackTokenRef.current = '';
       ttsBargeInTokenRef.current = '';
     }
+  }
+
+  // Tells the backend to stop synthesising that turn; aborting the fetches alone leaves the
+  // producer thread running until it finishes the whole segment.
+  function requestTtsTurnCancel(token) {
+    const parsed = parseTtsToken(token);
+    if (!parsed?.sessionId) return;
+    void api('/api/tts/cancel', { sessionId: parsed.sessionId, turnId: token }).catch(() => {});
+  }
+
+  function forgetTtsPlayedAudioKeys(token) {
+    if (!token) return;
+    const prefix = `${token}|`;
+    for (const key of ttsPlayedAudioKeysRef.current) {
+      if (key.startsWith(prefix)) ttsPlayedAudioKeysRef.current.delete(key);
+    }
+  }
+
+  // Stage one of barge-in: the backend heard speech, so drop the volume without giving up the
+  // playback position. Stage two (a confirmed intent) goes through stopTtsPlayback instead.
+  function duckTtsPlayback() {
+    if (ttsDuckedRef.current) return;
+    // Speech can start in the gap between two chunks; the flag makes playPreparedTtsAudio
+    // bring the next element in already ducked.
+    if (!ttsPlayingRef.current && !ttsPlaybackTokenRef.current) return;
+    ttsDuckedRef.current = true;
+    const audio = ttsAudioRef.current;
+    if (!audio) return;
+    // Kept so the metrics line can show where the duck landed; playback is never rewound.
+    ttsDuckedPositionRef.current = audio.currentTime || 0;
+    recordVoiceMetric(currentTtsToken(), 'duckedAtSec', ttsDuckedPositionRef.current || -1);
+    audio.volume = TTS_DUCK_VOLUME;
+  }
+
+  function restoreTtsPlaybackVolume() {
+    if (!ttsDuckedRef.current) return;
+    ttsDuckedRef.current = false;
+    ttsDuckedPositionRef.current = 0;
+    const audio = ttsAudioRef.current;
+    if (audio) audio.volume = 1;
+  }
+
+  function isBackendSpeechActive() {
+    if (!voiceSpeechActiveRef.current) return false;
+    const startedAt = voiceSpeechStartedAtRef.current;
+    return Boolean(startedAt) && Date.now() - startedAt < VOICE_SPEECH_HOLD_MAX_MS;
+  }
+
+  // Stage two of barge-in. An explicit interrupt phrase always counts; substantial speech only
+  // counts inside the confirmation window that opened when the backend VAD reported speech.
+  function shouldTriggerBargeIn(partialText) {
+    if (isBargeInIntent(partialText)) return true;
+    const startedAt = voiceSpeechStartedAtRef.current;
+    if (!startedAt || Date.now() - startedAt > BARGE_IN_CONFIRM_WINDOW_MS) return false;
+    return isSubstantialBargeInSpeech(partialText);
   }
 
   function ttsSynthesisTimeoutMs(text, voiceId = 'default') {
@@ -1823,7 +2474,7 @@ function App() {
         ttsPreviewAudioRef.current.pause();
         ttsPreviewAudioRef.current.currentTime = 0;
       }
-      const response = await fetch(`${voice.previewUrl}?t=${Date.now()}`);
+      const response = await fetch(`${voice.previewUrl}?t=${Date.now()}`, { headers: API_HEADERS });
       if (!response.ok) {
         const detail = await response.text().catch(() => '');
         throw new Error(detail || `${response.status} ${response.statusText}`);
@@ -1880,7 +2531,6 @@ function App() {
       ...current,
       current: { status: 'running', label: processingLabel },
     });
-    setAgentProgress(makeRunningProgress);
     const runningMessages = approvalAssistantId
       ? setAssistantProgressRunningInMessages(
           updateAssistantProgressInMessages(messages, approvalAssistantId, makeRunningProgress),
@@ -1908,7 +2558,6 @@ function App() {
     try {
       await streamChat({ sessionId: approvalSessionId, approval }, approvalAssistantId, approvalSessionId, runId, '/api/approval-stream');
       if (activeRunsRef.current[approvalSessionId]?.runId === runId) {
-        if (activeSessionRef.current === approvalSessionId) setAgentProgress((current) => finishAgentProgress(current, t));
         updateSessionMessages(approvalSessionId, (current) =>
           setAssistantProgressRunningInMessages(
             updateAssistantProgressInMessages(current, approvalAssistantId, (progress) => finishAgentProgress(progress, t)),
@@ -1921,7 +2570,6 @@ function App() {
     } catch (err) {
       if (activeSessionRef.current === approvalSessionId) {
         setError(format(t.streamFailed, { error: err.message }));
-        setAgentProgress((current) => ({ ...current, current: null }));
         if (approvalAssistantId) {
           updateAssistantProgress(approvalAssistantId, (current) => ({ ...current, current: null }));
           setAssistantProgressRunning(approvalAssistantId, false);
@@ -1962,46 +2610,6 @@ function App() {
     setSessions(response.sessions || []);
     setCollapsedWorkspaces((current) => ({ ...current, [workspacePath]: false }));
     await openSession(next);
-  }
-
-  async function loadDirectories(path) {
-    setDirectoryLoading(true);
-    setDirectoryError('');
-    const suffix = path ? `?path=${encodeURIComponent(path)}` : '';
-    const response = await api(`/api/directories${suffix}`);
-    setDirectoryLoading(false);
-    if (!response.ok) {
-      setDirectoryError(response.error || t.requestFailed);
-      return;
-    }
-    setDirectoryData(response);
-    setSelectedWorkspace(response.path || selectedWorkspace);
-  }
-
-  async function applyWorkspace(workspacePath = selectedWorkspace) {
-    const nextWorkspace = workspacePath.trim();
-    if (!nextWorkspace || workspaceBusy) return;
-    setBusy(true);
-    setError('');
-    const response = await api('/api/workspace', { workspace: nextWorkspace });
-    setBusy(false);
-    if (!response.ok) {
-      setError(response.error || t.requestFailed);
-      return;
-    }
-    setStatus(response);
-    setWorkspaceInput(response.workspace || nextWorkspace);
-    setSelectedWorkspace(response.workspace || nextWorkspace);
-    setDirectoryPickerOpen(false);
-    const nextSessionId = `web-${Date.now().toString(36)}`;
-    activeSessionRef.current = nextSessionId;
-    setSessionId(nextSessionId);
-    setMessages([]);
-    setAgentProgress({ items: [], current: null, summary: '' });
-    setPendingApproval(null);
-    setPendingApprovalAssistantId('');
-    setApprovalProcessing(false);
-    refreshSessions();
   }
 
   async function saveSettings(event) {
@@ -2060,7 +2668,6 @@ function App() {
       setApprovalEdit(JSON.stringify(response.pendingApproval.toolInput, null, 2));
     }
     if (Array.isArray(response.todos)) {
-      setTodos(response.todos);
       if (targetAssistantId) {
         setAssistantTodos(targetAssistantId, response.todos);
       } else {
@@ -2077,10 +2684,13 @@ function App() {
     try {
       const response = await fetch(endpoint, {
         method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
+        headers: { ...API_HEADERS, 'Content-Type': 'application/json' },
         body: JSON.stringify({ ...payload, runId }),
         signal: controller.signal,
       });
+      // The server may have restarted since this page was served; a 403 here
+      // means a stale token, and reloading is what fixes it.
+      if (handleUnauthorizedResponse(response)) return;
       if (!response.body) {
         setError(t.streamUnavailable);
         return;
@@ -2109,7 +2719,7 @@ function App() {
         setError(format(t.streamFailed, { error: err.message }));
         setAssistantProgressRunning(assistantId, false);
       }
-      if (shouldDelayCustomVoiceDisplay(streamSessionId)) {
+      if (shouldDelayCustomVoiceDisplay(streamSessionId, responseAssistantId)) {
         queueAssistantTtsDelta(streamSessionId, responseAssistantId, '', {
           force: true,
           delayDisplay: true,
@@ -2128,34 +2738,49 @@ function App() {
     const isActiveSession = activeSessionRef.current === streamSessionId;
     const responseAssistantId = activeRunsRef.current[streamSessionId]?.responseAssistantId || assistantId;
     if (event.type === 'progress') {
-      if (isActiveSession) setAgentProgress((current) => updateAgentProgress(current, event, t));
       updateSessionMessages(streamSessionId, (current) =>
         updateAssistantProgressInMessages(current, assistantId, (progress) => updateAgentProgress(progress, event, t)),
       );
       return;
     }
+    if (event.type === 'heartbeat') {
+      const waited = Number(event.waitedSec);
+      updateSessionMessages(streamSessionId, (current) =>
+        setAssistantHeartbeatInMessages(current, responseAssistantId, Number.isFinite(waited) ? waited : 0),
+      );
+      return;
+    }
+    if (event.type === 'usage') {
+      updateSessionMessages(streamSessionId, (current) =>
+        setAssistantUsageInMessages(current, responseAssistantId, {
+          inputTokens: Number(event.inputTokens) || 0,
+          outputTokens: Number(event.outputTokens) || 0,
+          totalTokens: Number(event.totalTokens) || 0,
+        }),
+      );
+      return;
+    }
+    if (event.type === 'notice') {
+      const noticeText = String(event.message || '').trim();
+      if (noticeText && isActiveSession) pushToast({ message: noticeText, tone: 'info' });
+      if (event.kind === 'context_compacted') {
+        updateSessionMessages(streamSessionId, (current) => [
+          ...current,
+          { id: crypto.randomUUID(), role: 'system', kind: 'divider', content: t.contextCompacted },
+        ]);
+      }
+      return;
+    }
     if (event.type === 'delta') {
-      if (shouldDelayCustomVoiceDisplay(streamSessionId)) {
+      updateSessionMessages(streamSessionId, (current) =>
+        setAssistantHeartbeatInMessages(current, responseAssistantId, null),
+      );
+      if (shouldDelayCustomVoiceDisplay(streamSessionId, responseAssistantId)) {
         setAssistantVoiceTtsPreparing(streamSessionId, responseAssistantId, true);
         queueAssistantTtsDelta(streamSessionId, responseAssistantId, event.content || '', { delayDisplay: true });
         return;
       }
-      const displayDelta = takeMarkdownDisplayDelta(streamSessionId, responseAssistantId, event.content || '');
-      updateSessionMessages(streamSessionId, (current) =>
-        current.map((message) =>
-          message.id === responseAssistantId
-            ? {
-                ...message,
-                content: `${message.content}${displayDelta}`,
-                thinkingRunning: false,
-                contentPlacement: contentPlacementForMessage({
-                  ...message,
-                  content: `${message.content}${displayDelta}`,
-                }),
-              }
-            : message,
-        ),
-      );
+      queueDisplayDelta(streamSessionId, responseAssistantId, event.content || '');
       queueAssistantTtsDelta(streamSessionId, responseAssistantId, event.content || '');
       return;
     }
@@ -2191,6 +2816,17 @@ function App() {
         );
         return;
       }
+      if (event.ok === true) {
+        const preview = String(event.preview || '');
+        if (preview) {
+          updateSessionMessages(streamSessionId, (current) =>
+            updateAssistantProgressInMessages(current, assistantId, (progress) =>
+              attachToolPreviewToProgress(progress, event),
+            ),
+          );
+        }
+        return;
+      }
       if (shouldHideToolResult(event.content)) return;
       updateSessionMessages(streamSessionId, (current) =>
         ensurePostToolAssistantMessage(
@@ -2210,10 +2846,6 @@ function App() {
     }
     if (event.type === 'todos') {
       const nextTodos = Array.isArray(event.todos) ? event.todos : [];
-      if (isActiveSession) {
-        setTodos(nextTodos);
-        setAgentProgress((current) => ({ ...current, summary: event.summary || current.summary }));
-      }
       updateSessionMessages(streamSessionId, (current) =>
         updateAssistantProgressInMessages(
           setAssistantTodosInMessages(current, assistantId, nextTodos),
@@ -2225,12 +2857,7 @@ function App() {
     }
     if (event.type === 'pending_approval') {
       sessionPendingApprovalsRef.current[streamSessionId] = event.pendingApproval;
-      const flushedMarkdown = flushMarkdownDisplayDelta(streamSessionId, responseAssistantId);
-      if (flushedMarkdown) {
-        updateSessionMessages(streamSessionId, (current) =>
-          appendAssistantContentInMessages(current, responseAssistantId, flushedMarkdown),
-        );
-      }
+      flushQueuedDisplayDelta(streamSessionId, responseAssistantId, { flushMarkdown: true });
       stopTtsPlayback({
         clearQueue: true,
         stopVoice: true,
@@ -2249,16 +2876,11 @@ function App() {
       if (!event.cancelled) {
         delete sessionPendingApprovalsRef.current[streamSessionId];
       }
-      const delayCustomVoiceDisplay = !event.cancelled && isActiveSession && shouldDelayCustomVoiceDisplay(streamSessionId);
-      const flushedMarkdown = event.cancelled || delayCustomVoiceDisplay
-        ? ''
-        : flushMarkdownDisplayDelta(streamSessionId, responseAssistantId);
-      if (flushedMarkdown) {
-        updateSessionMessages(streamSessionId, (current) =>
-          appendAssistantContentInMessages(current, responseAssistantId, flushedMarkdown),
-        );
+      const delayCustomVoiceDisplay =
+        !event.cancelled && isActiveSession && shouldDelayCustomVoiceDisplay(streamSessionId, responseAssistantId);
+      if (!event.cancelled && !delayCustomVoiceDisplay) {
+        flushQueuedDisplayDelta(streamSessionId, responseAssistantId, { flushMarkdown: true });
       }
-      if (isActiveSession) setAgentProgress((current) => finishAgentProgress(current, t));
       updateSessionMessages(streamSessionId, (current) =>
         setAssistantProgressRunningInMessages(
           updateAssistantProgressInMessages(current, assistantId, (progress) => finishAgentProgress(progress, t)),
@@ -2280,7 +2902,7 @@ function App() {
           delayDisplay: delayCustomVoiceDisplay,
         });
       }
-      if (!event.cancelled && isActiveSession && voiceConversationActiveRef.current && !ttsEnabled) {
+      if (!event.cancelled && isActiveSession && voiceConversationActiveRef.current && !ttsEnabledRef.current) {
         if (voiceActiveRef.current) void stopVoiceCapture({ cancel: true, submit: false });
         scheduleVoiceConversationListen(350);
       }
@@ -2295,15 +2917,37 @@ function App() {
         });
       }
       clearRunIfCurrent(streamSessionId, runId);
-      if (!isActiveSession) refreshSessions();
+      if (!isActiveSession) {
+        markSessionUnread(streamSessionId);
+        refreshSessions();
+      }
       return;
     }
     if (event.type === 'error') {
-      clearMarkdownDeltaBuffer(streamSessionId, responseAssistantId);
+      flushQueuedDisplayDelta(streamSessionId, responseAssistantId, { flushMarkdown: true });
       stopVoiceConversation();
       if (isActiveSession) {
-        setError(event.error || t.requestFailed);
-        setAgentProgress((current) => ({ ...current, current: null }));
+        const hint = errorCodeHint(event.code, t);
+        const baseMessage = String(event.error || event.message || '').trim() || t.requestFailed;
+        const message = hint ? `${baseMessage} · ${hint}` : baseMessage;
+        const failedRun = activeRunsRef.current[streamSessionId];
+        const retryText = failedRun?.text || lastUserTextRef.current;
+        // The retry has to be pinned to the session and the user message of THIS run: the
+        // rendered session may have changed by the time the button is pressed.
+        pushToast({
+          message,
+          tone: 'error',
+          fatal: true,
+          retry:
+            event.retriable && retryText
+              ? {
+                  sessionId: streamSessionId,
+                  userMessageId: failedRun?.userMessageId || '',
+                  assistantId: responseAssistantId,
+                  text: retryText,
+                }
+              : null,
+        });
       }
       updateSessionMessages(streamSessionId, (current) =>
         setAssistantProgressRunningInMessages(
@@ -2316,13 +2960,46 @@ function App() {
       );
       clearRunIfCurrent(streamSessionId, runId);
       delete sessionPendingApprovalsRef.current[streamSessionId];
-      if (!isActiveSession) refreshSessions();
+      if (!isActiveSession) {
+        markSessionUnread(streamSessionId);
+        refreshSessions();
+      }
     }
+    // Unknown event types are ignored on purpose so a newer backend never breaks the UI.
+  }
+
+  async function retryFailedTurn(toast) {
+    const retry = toast?.retry;
+    dismissToast(toast?.id);
+    if (!retry?.text) return;
+    const retrySessionId = retry.sessionId || activeSessionRef.current;
+    if (!retrySessionId) return;
+    if (activeSessionRef.current !== retrySessionId) {
+      await openSession(retrySessionId);
+      if (activeSessionRef.current !== retrySessionId) return;
+    }
+    // The backend already dropped the failed turn, so resending the text is right; the UI
+    // must reuse the existing user bubble instead of adding a second one, and the failed
+    // turn's empty assistant bubble has to go.
+    await submitMessage(retry.text, {
+      clearInput: false,
+      targetSessionId: retrySessionId,
+      reuseUserMessageId: retry.userMessageId,
+      dropAssistantMessageId: retry.assistantId,
+      // activeRunsRef is the authoritative "already running" check and is cleared on error;
+      // the runningSessions map can still hold a stale entry for the session we switched to.
+      ignoreStaleRunning: true,
+    });
+  }
+
+  function markSessionUnread(targetSessionId) {
+    if (!targetSessionId || targetSessionId === activeSessionRef.current) return;
+    setUnreadSessions((current) => (current[targetSessionId] ? current : { ...current, [targetSessionId]: true }));
   }
 
   function voiceWsUrl() {
     const scheme = window.location.protocol === 'https:' ? 'wss:' : 'ws:';
-    return `${scheme}//${window.location.host}/api/asr/stream`;
+    return `${scheme}//${window.location.host}/api/asr/stream?token=${encodeURIComponent(API_TOKEN)}`;
   }
 
   function clearVoiceRestartTimer() {
@@ -2391,6 +3068,8 @@ function App() {
     voiceDraftUserIdRef.current = '';
     voiceLastPartialTextRef.current = '';
     voiceLastPartialChangedAtRef.current = 0;
+    voiceSpeechActiveRef.current = false;
+    voiceSpeechStartedAtRef.current = 0;
     clearVoiceAutoFinishTimer();
     bargeInTriggeredRef.current = Boolean(bargeIn && forceBargeIn);
     bargeInContextRef.current = bargeIn ? context : null;
@@ -2410,6 +3089,20 @@ function App() {
           setVoiceStatus(t.voiceListening);
           return;
         }
+        // Stage one of barge-in: the backend VAD reports speech before any transcript exists,
+        // so duck the assistant instead of cutting it off on a cough or a filler word.
+        if (payload.type === 'speech') {
+          const speaking = payload.state === 'start';
+          voiceSpeechActiveRef.current = speaking;
+          if (speaking) {
+            voiceSpeechStartedAtRef.current = Date.now();
+            if (bargeIn && !bargeInTriggeredRef.current) duckTtsPlayback();
+          } else {
+            voiceSpeechStartedAtRef.current = 0;
+            if (!bargeInTriggeredRef.current) restoreTtsPlaybackVolume();
+          }
+          return;
+        }
         if (payload.type === 'partial') {
           const partialText = String(payload.text || '').trim();
           setVoiceStatus(partialText ? t.voiceTranscribing : bargeIn ? t.bargeInListening : t.voiceListening);
@@ -2420,8 +3113,9 @@ function App() {
             } else if (!voiceLastPartialChangedAtRef.current) {
               voiceLastPartialChangedAtRef.current = Date.now();
             }
-            if (bargeIn && !bargeInTriggeredRef.current && isBargeInIntent(partialText)) {
+            if (bargeIn && !bargeInTriggeredRef.current && shouldTriggerBargeIn(partialText)) {
               bargeInTriggeredRef.current = true;
+              recordVoiceMetric(currentTtsToken(), 'bargeInDetectedAt', Date.now());
               setVoiceStatus(t.bargeInDetected);
               stopTtsPlayback({ clearQueue: true, stopVoice: false, suppressCurrent: true });
               if (activeRunsRef.current[voiceSessionIdRef.current]) stopGeneration({ stopVoice: false });
@@ -2439,31 +3133,37 @@ function App() {
           return;
         }
         if (payload.type === 'final') {
-          const finalText = String(payload.text || input).trim();
+          const finalText = String(payload.text || voiceLastPartialTextRef.current).trim();
           const semanticState = payload.semanticVad?.state || '';
+          clearVoiceFinishFallbackTimer();
           clearVoiceAutoFinishTimer();
           voiceSocketRef.current = null;
+          try {
+            ws.close();
+          } catch {
+            // Already closed by the browser or the server.
+          }
           submitVoiceCaptureText(finalText, { bargeIn, semanticState });
           return;
         }
         if (payload.type === 'error') {
           const message = payload.error || t.requestFailed;
-          setVoiceError(message);
-          setError(format(t.voiceUnavailable, { error: message }));
+          pushToast({ message: format(t.voiceUnavailable, { error: message }), tone: 'error' });
           void stopVoiceCapture({ cancel: true, submit: false });
         }
       };
 
       ws.onerror = () => {
-        setVoiceError(t.requestFailed);
-        setError(format(t.voiceUnavailable, { error: t.requestFailed }));
+        pushToast({ message: format(t.voiceUnavailable, { error: t.requestFailed }), tone: 'error' });
         void stopVoiceCapture({ cancel: true, submit: false });
       };
 
       await startVoiceAudioPipeline(ws);
     } catch (err) {
-      setVoiceError(err.message);
-      setError(err.name === 'NotAllowedError' ? t.voicePermissionDenied : format(t.voiceUnavailable, { error: err.message }));
+      pushToast({
+        message: err.name === 'NotAllowedError' ? t.voicePermissionDenied : format(t.voiceUnavailable, { error: err.message }),
+        tone: 'error',
+      });
       await stopVoiceCapture({ cancel: true, submit: false });
     }
   }
@@ -2500,6 +3200,10 @@ function App() {
     bargeInContextRef.current = null;
     voiceLastPartialTextRef.current = '';
     voiceLastPartialChangedAtRef.current = 0;
+    // A capture that ends while ducked must not leave the next reply at 20% volume.
+    voiceSpeechActiveRef.current = false;
+    voiceSpeechStartedAtRef.current = 0;
+    restoreTtsPlaybackVolume();
   }
 
   function submitVoiceCaptureText(finalText, { bargeIn = false, semanticState = '' } = {}) {
@@ -2538,13 +3242,21 @@ function App() {
     }
   }
 
-  function clearVoiceAutoFinishTimer() {
+  function clearVoiceFinishFallbackTimer() {
+    if (voiceFinishFallbackTimerRef.current) {
+      window.clearTimeout(voiceFinishFallbackTimerRef.current);
+    }
+    voiceFinishFallbackTimerRef.current = null;
+  }
+
+  function clearVoiceAutoFinishTimer({ keepFinishFallback = false } = {}) {
     if (voiceAutoFinishTimerRef.current) {
       window.clearTimeout(voiceAutoFinishTimerRef.current);
     }
     voiceAutoFinishTimerRef.current = null;
     voiceAutoFinishTextRef.current = '';
     voiceAutoFinishModeRef.current = '';
+    if (!keepFinishFallback) clearVoiceFinishFallbackTimer();
   }
 
   function isDiscardableVoiceFinal(text, semanticState) {
@@ -2561,6 +3273,9 @@ function App() {
       return;
     }
     if (bargeIn && !bargeInTriggeredRef.current) return;
+    // Once `finish` has been sent we are waiting for the server `final`; a late partial
+    // must not clobber the fallback timer.
+    if (voiceStoppingRef.current || voiceFinishFallbackTimerRef.current) return;
     const ws = voiceSocketRef.current;
     if (!ws || ws.readyState !== WebSocket.OPEN) return;
 
@@ -2578,24 +3293,46 @@ function App() {
     clearVoiceAutoFinishTimer();
     voiceAutoFinishTextRef.current = text;
     voiceAutoFinishModeRef.current = mode;
-    voiceAutoFinishTimerRef.current = window.setTimeout(() => {
+    const finishWhenStable = () => {
       if (!voiceActiveRef.current || voiceStoppingRef.current || voiceSocketRef.current !== ws) return;
       if (voiceLastPartialTextRef.current !== text) return;
       if (Date.now() - changedAt < targetStableMs - 100) return;
+      // The backend VAD still hears the user: finishing now would cut the turn in half and
+      // race the backend `final`. Re-check instead of giving the timer up. The age bound stops
+      // a `speech start` that never gets its `end` from wedging the turn open forever.
+      if (isBackendSpeechActive()) {
+        voiceAutoFinishTimerRef.current = window.setTimeout(finishWhenStable, 300);
+        return;
+      }
       setVoiceStatus(t.voiceFinalizing);
       voiceAutoFinishTimerRef.current = null;
       voiceAutoFinishTextRef.current = '';
       voiceAutoFinishModeRef.current = '';
       voiceStoppingRef.current = true;
-      voiceSocketRef.current = null;
+      void stopVoiceAudioOnly();
       try {
-        if (ws.readyState === WebSocket.OPEN) ws.send(JSON.stringify({ type: 'cancel' }));
-        ws.close();
+        if (ws.readyState === WebSocket.OPEN) ws.send(JSON.stringify({ type: 'finish' }));
       } catch {
-        // Best effort: the transcript is already stable enough to submit.
+        voiceSocketRef.current = null;
+        submitVoiceCaptureText(text, { bargeIn, semanticState });
+        return;
       }
-      submitVoiceCaptureText(text, { bargeIn, semanticState });
-    }, delay);
+      // Wait up to 800ms for the server `final`; the branch that handles `final`
+      // clears this timer explicitly.
+      clearVoiceFinishFallbackTimer();
+      voiceFinishFallbackTimerRef.current = window.setTimeout(() => {
+        voiceFinishFallbackTimerRef.current = null;
+        if (voiceSocketRef.current !== ws) return;
+        voiceSocketRef.current = null;
+        try {
+          ws.close();
+        } catch {
+          // Already closed by the browser or the server.
+        }
+        submitVoiceCaptureText(text, { bargeIn, semanticState });
+      }, 800);
+    };
+    voiceAutoFinishTimerRef.current = window.setTimeout(finishWhenStable, delay);
   }
 
   async function stopVoiceAudioOnly() {
@@ -2622,7 +3359,7 @@ function App() {
         channelCount: 1,
         echoCancellation: true,
         noiseSuppression: true,
-        autoGainControl: true,
+        autoGainControl: false, // AGC lifts a far-away voice to near-field level, which is exactly what the VAD near-field gate reads.
       },
       video: false,
     });
@@ -2639,7 +3376,8 @@ function App() {
       const inputChannel = event.inputBuffer.getChannelData(0);
       const resampled = resampleLinear(inputChannel, audioContext.sampleRate, 16000);
       const next = concatFloat32(voiceBufferRef.current, resampled);
-      const chunkSamples = 8000;
+      // 200 ms at 16 kHz: smaller frames let the backend VAD/partials react sooner.
+      const chunkSamples = 3200;
       let offset = 0;
       while (next.length - offset >= chunkSamples) {
         const chunk = next.slice(offset, offset + chunkSamples);
@@ -2700,6 +3438,14 @@ function App() {
       setSessionMenu(null);
       return;
     }
+    // Never leave a partially buffered frame behind when the feed switches away.
+    flushActiveRunDisplayDelta(activeSessionRef.current);
+    setUnreadSessions((current) => {
+      if (!current[id]) return current;
+      const next = { ...current };
+      delete next[id];
+      return next;
+    });
     const activeRun = activeRunsRef.current[id];
     const cachedMessages = activeRun ? sessionLiveMessagesRef.current[id] || activeRun.initialMessages || [] : [];
     if (activeRun && cachedMessages.length > 0) {
@@ -2707,13 +3453,14 @@ function App() {
       const cachedApproval = sessionPendingApprovalsRef.current[id] || null;
       activeSessionRef.current = id;
       setSessionId(id);
+      // Kept in step with setMessages so callers that act right after an await (retry) never
+      // read the previous session's list.
+      messagesRef.current = cachedMessages;
       setMessages(cachedMessages);
       setPendingApproval(cachedApproval);
       setPendingApprovalAssistantId(cachedApproval ? activeRun.assistantId || findLastAssistantId(cachedMessages) : '');
       setApprovalEdit(cachedApproval ? JSON.stringify(cachedApproval.toolInput, null, 2) : '');
       setApprovalProcessing(false);
-      setAgentProgress({ items: [], current: null, summary: '' });
-      setTodos([]);
       setError('');
       setInput('');
       setSlashMenuOpen(false);
@@ -2729,12 +3476,11 @@ function App() {
     }
     activeSessionRef.current = id;
     setSessionId(id);
+    messagesRef.current = [];
     setMessages([]);
     setPendingApproval(null);
     setPendingApprovalAssistantId('');
     setApprovalProcessing(false);
-    setAgentProgress({ items: [], current: null, summary: '' });
-    setTodos([]);
     setError('');
     setInput('');
     setSlashMenuOpen(false);
@@ -2744,6 +3490,7 @@ function App() {
     if (activeSessionRef.current !== id) return;
     if (!response.ok) {
       setError(response.error || t.requestFailed);
+      messagesRef.current = [];
       setMessages([]);
       return;
     }
@@ -2768,8 +3515,8 @@ function App() {
     const restoredMessages = shouldAttachSessionTodos(loadedMessages, loadedTodos, response.pendingApproval)
       ? attachTodosToLastAssistant(loadedMessages, loadedTodos)
       : loadedMessages;
+    messagesRef.current = restoredMessages;
     setMessages(restoredMessages);
-    setTodos(loadedTodos);
     if (response.workspace) {
       setWorkspaceInput(response.workspace);
       setSelectedWorkspace(response.workspace);
@@ -2807,8 +3554,6 @@ function App() {
         activeSessionRef.current = '';
         setSessionId('');
         setMessages([]);
-        setAgentProgress({ items: [], current: null, summary: '' });
-        setTodos([]);
         setPendingApproval(null);
         setPendingApprovalAssistantId('');
         setError('');
@@ -2842,8 +3587,6 @@ function App() {
         suppressToken: activeRun?.assistantId ? ttsToken(id, activeRun.assistantId) : '',
       });
       setMessages([]);
-      setAgentProgress({ items: [], current: null, summary: '' });
-      setTodos([]);
       setPendingApproval(null);
       setPendingApprovalAssistantId('');
       setApprovalEdit('');
@@ -2995,7 +3738,7 @@ function App() {
           <PanelLeftOpen size={18} />
         </button>
       )}
-      <aside className="sidebar" aria-label="Session navigation" aria-hidden={sidebarCollapsed}>
+      <aside className="sidebar" aria-label="Session navigation" aria-hidden={sidebarCollapsed} inert={sidebarCollapsed}>
         <div className="sidebar-header">
           <div className="brand">
             <div className="brand-mark">
@@ -3060,6 +3803,10 @@ function App() {
                         ) : (
                           <button className="session-item" onClick={() => openSession(session.id)}>
                             <Bot size={16} />
+                            {runningSessions[session.id] && <span className="session-running-dot" aria-label={t.working} />}
+                            {!runningSessions[session.id] && unreadSessions[session.id] && (
+                              <span className="session-unread-dot" aria-label={t.sessionCompleted} />
+                            )}
                             <span>{session.title || session.id}</span>
                           </button>
                         )}
@@ -3164,6 +3911,25 @@ function App() {
                 {status?.hasApiKey ? t.keyReady : t.toolMode}
               </span>
             </div>
+            <div className="theme-toggle" role="group" aria-label={t.theme}>
+              {[
+                { mode: 'system', icon: <Monitor size={14} />, label: t.themeSystem },
+                { mode: 'light', icon: <Sun size={14} />, label: t.themeLight },
+                { mode: 'dark', icon: <Moon size={14} />, label: t.themeDark },
+              ].map((option) => (
+                <button
+                  key={option.mode}
+                  type="button"
+                  className={themeMode === option.mode ? 'active' : ''}
+                  aria-pressed={themeMode === option.mode}
+                  title={option.label}
+                  aria-label={option.label}
+                  onClick={() => applyThemeMode(option.mode)}
+                >
+                  {option.icon}
+                </button>
+              ))}
+            </div>
             <button
               className={`settings-button ${settingsOpen ? 'active' : ''}`}
               onClick={() => setSettingsOpen((open) => !open)}
@@ -3175,6 +3941,15 @@ function App() {
           </div>
         </div>
       </aside>
+
+      {!sidebarCollapsed && (
+        <button
+          type="button"
+          className="sidebar-scrim"
+          onClick={() => setSidebarCollapsed(true)}
+          aria-label={t.close}
+        />
+      )}
 
       <main className="conversation" aria-label="Chat workspace">
         <header className="topbar">
@@ -3188,7 +3963,14 @@ function App() {
           </div>
         </header>
 
-        <section className="message-feed" ref={scrollRef} onScroll={handleMessageFeedScroll}>
+        <section
+          className="message-feed"
+          ref={scrollRef}
+          onScroll={handleMessageFeedScroll}
+          role="log"
+          aria-live="polite"
+          aria-relevant="additions"
+        >
           <div className="message-column">
             {messages.map((message) => (
               <Message
@@ -3206,18 +3988,34 @@ function App() {
           </div>
         </section>
 
-        {error && (
-          <div className="error-strip">
-            <CircleAlert size={16} />
-            {error}
-          </div>
-        )}
-        {voiceError && (
-          <div className="error-strip">
-            <CircleAlert size={16} />
-            {voiceError}
-          </div>
-        )}
+        <div className="toast-stack" role="status" aria-live="polite">
+          {error && (
+            <div className="toast">
+              <CircleAlert size={16} />
+              <span>{error}</span>
+              <button type="button" onClick={() => setError('')} aria-label={t.close}><X size={15} /></button>
+            </div>
+          )}
+          {voiceError && (
+            <div className="toast">
+              <CircleAlert size={16} />
+              <span>{voiceError}</span>
+              <button type="button" onClick={() => setVoiceError('')} aria-label={t.close}><X size={15} /></button>
+            </div>
+          )}
+          {toasts.map((toast) => (
+            <div key={toast.id} className={`toast ${toast.tone === 'info' ? 'info' : ''}`.trim()}>
+              <CircleAlert size={16} />
+              <span>{toast.message}</span>
+              {toast.retry?.text && (
+                <button type="button" className="toast-retry" onClick={() => void retryFailedTurn(toast)}>
+                  {t.retry}
+                </button>
+              )}
+              <button type="button" onClick={() => dismissToast(toast.id)} aria-label={t.close}><X size={15} /></button>
+            </div>
+          ))}
+        </div>
 
         <div className="composer-stack">
           {showJumpToLatest && (
@@ -3228,7 +4026,28 @@ function App() {
           )}
 
           {pendingApproval && (
-            <section className="approval-strip" aria-label="Tool approval">
+            <section
+              className="approval-strip"
+              aria-label="Tool approval"
+              ref={approvalSectionRef}
+              tabIndex={-1}
+              onKeyDown={(event) => {
+                if (event.key === 'Escape') {
+                  event.preventDefault();
+                  const target = event.target;
+                  // Esc inside the edit box only leaves the box; a second Esc rejects.
+                  if (target instanceof HTMLTextAreaElement || target instanceof HTMLInputElement) {
+                    target.blur();
+                    approvalSectionRef.current?.focus();
+                    return;
+                  }
+                  approve('reject');
+                } else if (event.key === 'Enter' && (event.metaKey || event.ctrlKey)) {
+                  event.preventDefault();
+                  approve('accept');
+                }
+              }}
+            >
               <div className="approval-summary">
                 <SlidersHorizontal size={16} />
                 <div>
@@ -3236,16 +4055,17 @@ function App() {
                   <span>{pendingApproval.payload?.risk?.reason || t.reviewToolInput}</span>
                 </div>
               </div>
-              <details>
-                <summary>{t.toolInput}</summary>
-                <pre>{JSON.stringify(pendingApproval.toolInput, null, 2)}</pre>
-              </details>
+              <ApprovalToolInput toolName={pendingApproval.toolName} toolInput={pendingApproval.toolInput} t={t} />
               <textarea
                 value={approvalEdit}
                 onChange={(event) => setApprovalEdit(event.target.value)}
+                className={approvalEditError ? 'invalid' : ''}
                 rows={3}
                 aria-label={t.approvalEditLabel}
+                aria-invalid={Boolean(approvalEditError)}
+                aria-describedby={approvalEditError ? 'approval-json-error' : undefined}
               />
+              {approvalEditError && <span id="approval-json-error" className="approval-json-error">{approvalEditError}</span>}
               <div className="approval-actions">
                 <button className="accept" onClick={() => approve('accept')}>
                   <Check size={15} />
@@ -3257,7 +4077,7 @@ function App() {
                     {t.acceptRemember}
                   </button>
                 )}
-                <button onClick={() => approve('edit')}>{t.edit}</button>
+                <button disabled={Boolean(approvalEditError)} onClick={() => approve('edit')}>{t.edit}</button>
                 <button onClick={() => approve('feedback')}>{t.feedback}</button>
                 <button className="reject" onClick={() => approve('reject')}>
                   <X size={15} />
@@ -3627,6 +4447,56 @@ function appendAssistantContentInMessages(messages, assistantId, content) {
   });
 }
 
+function setAssistantHeartbeatInMessages(messages, assistantId, waitedSec) {
+  let changed = false;
+  const next = messages.map((message) => {
+    if (message.id !== assistantId) return message;
+    const current = message.heartbeatSec ?? null;
+    if (current === waitedSec) return message;
+    changed = true;
+    return { ...message, heartbeatSec: waitedSec };
+  });
+  return changed ? next : messages;
+}
+
+function setAssistantUsageInMessages(messages, assistantId, usage) {
+  return messages.map((message) => (message.id === assistantId ? { ...message, usage } : message));
+}
+
+function attachToolPreviewToProgress(progress, event) {
+  const items = progress?.items || [];
+  if (!items.length) return progress;
+  let index = items.length - 1;
+  if (event.toolName) {
+    for (let cursor = items.length - 1; cursor >= 0; cursor -= 1) {
+      if (items[cursor].toolName === event.toolName) {
+        index = cursor;
+        break;
+      }
+    }
+  }
+  const nextItems = [...items];
+  nextItems[index] = {
+    ...nextItems[index],
+    preview: String(event.preview || ''),
+    previewTruncated: Boolean(event.truncated),
+  };
+  return { ...progress, items: nextItems };
+}
+
+const ERROR_CODE_TRANSLATION_KEYS = {
+  auth: 'errorAuth',
+  rate_limit: 'errorRateLimit',
+  model_timeout: 'errorModelTimeout',
+  context_overflow: 'errorContextOverflow',
+  network: 'errorNetwork',
+};
+
+function errorCodeHint(code, t) {
+  const key = ERROR_CODE_TRANSLATION_KEYS[String(code || '')];
+  return key ? t[key] || '' : '';
+}
+
 function archiveAssistantProgress(messages) {
   return messages.map((message) => {
     if (message.role !== 'assistant') return message;
@@ -3713,15 +4583,17 @@ function parseTtsToken(token) {
   };
 }
 
-function splitTtsText(text, { force = false, compact = false } = {}) {
+function splitTtsText(text, { force = false, compact = false, first = false } = {}) {
   let buffer = String(text || '').trimStart();
   const chunks = [];
-  const minReadyLength = compact ? 72 : 48;
-  while (buffer.length >= minReadyLength) {
-    const boundary = findBalancedTtsBoundary(buffer, { compact });
+  let firstChunk = first;
+  const readyLength = () => (firstChunk ? FIRST_TTS_CHUNK_MIN : compact ? 72 : 48);
+  while (buffer.length >= readyLength()) {
+    const boundary = findBalancedTtsBoundary(buffer, { compact, first: firstChunk });
     if (boundary <= 0) break;
     chunks.push(buffer.slice(0, boundary).trim());
     buffer = buffer.slice(boundary).trimStart();
+    firstChunk = false;
   }
   if (force && buffer.trim()) {
     appendFinalTtsChunks(chunks, splitBalancedFinalTtsChunks(buffer.trim(), { compact }), { compact });
@@ -3743,7 +4615,38 @@ function appendFinalTtsChunks(chunks, finalChunks, { compact = false } = {}) {
   }
 }
 
-function findBalancedTtsBoundary(text, { compact = false } = {}) {
+// The very first spoken chunk is cut short (12-20 chars, or at the first sentence
+// punctuation, whichever comes first) so playback starts as soon as possible.
+const FIRST_TTS_CHUNK_MIN = 12;
+const FIRST_TTS_CHUNK_MAX = 20;
+const STRONG_TTS_MARKS = ['。', '！', '？', '!', '?', '；', ';', '\n'];
+const WEAK_TTS_MARKS = ['，', ',', '、', '：', ':'];
+
+function findFirstTtsBoundary(text) {
+  const length = text.length;
+  if (length < FIRST_TTS_CHUNK_MIN) return -1;
+  const endLimit = Math.min(length, FIRST_TTS_CHUNK_MAX);
+  const strong = earliestTtsCut(text, { to: endLimit, marks: STRONG_TTS_MARKS });
+  if (strong > 0) return strong;
+  const weak = earliestTtsCut(text, { from: FIRST_TTS_CHUNK_MIN, to: endLimit, marks: WEAK_TTS_MARKS });
+  if (weak > 0) return weak;
+  if (length >= FIRST_TTS_CHUNK_MAX) return snapToWordBoundary(text, endLimit);
+  return -1;
+}
+
+function earliestTtsCut(text, { from = 1, to, marks }) {
+  const markSet = new Set(marks);
+  for (let index = Math.max(0, from - 1); index < to; index += 1) {
+    if (!markSet.has(text[index])) continue;
+    let end = index + 1;
+    while (end < text.length && '”’）】」』'.includes(text[end])) end += 1;
+    return end;
+  }
+  return -1;
+}
+
+function findBalancedTtsBoundary(text, { compact = false, first = false } = {}) {
+  if (first) return findFirstTtsBoundary(text);
   if (compact) return findCustomVoiceTtsBoundary(text);
   const length = text.length;
   const min = 44;
@@ -3768,7 +4671,7 @@ function findCustomVoiceTtsBoundary(text) {
     from: min,
     target,
     to: endLimit,
-    marks: ['。', '！', '？', '!', '?', '；', ';', '\n'],
+    marks: STRONG_TTS_MARKS,
   });
   if (strong > 0) return strong;
   if (length >= target) {
@@ -3776,7 +4679,7 @@ function findCustomVoiceTtsBoundary(text) {
       from: Math.max(min, target - 10),
       target,
       to: endLimit,
-      marks: ['，', ',', '、', '：', ':'],
+      marks: WEAK_TTS_MARKS,
     });
     if (weak > 0) return weak;
   }
@@ -3841,8 +4744,25 @@ function base64AudioBlob(value, contentType) {
   return new Blob([bytes], { type: contentType || 'audio/wav' });
 }
 
+const BARGE_IN_CJK_FILLERS = ['嗯', '啊', '哦', '对', '好'];
+const BARGE_IN_LATIN_FILLERS = ['uh', 'um', 'yeah', 'ok'];
+
+// Non-keyword barge-in: enough real content to be a genuine interruption rather than a
+// backchannel. Chinese is counted in characters, English in words.
+function isSubstantialBargeInSpeech(text) {
+  let stripped = String(text || '')
+    .toLowerCase()
+    .replace(/[，,。！？!?；;：:、~～…"'“”‘’（）()]/g, ' ');
+  for (const filler of BARGE_IN_CJK_FILLERS) stripped = stripped.split(filler).join(' ');
+  const words = stripped
+    .split(/\s+/)
+    .filter((word) => word && /[a-z0-9]/.test(word) && !BARGE_IN_LATIN_FILLERS.includes(word));
+  if (words.length >= 2) return true;
+  return (stripped.match(/[一-鿿]/g) || []).length >= 4;
+}
+
 function isBargeInIntent(text) {
-  const compact = String(text || '').replace(/\s+/g, '');
+  const compact = String(text || '').replace(/\s+/g, '').toLowerCase();
   if (!compact) return false;
   const keywords = [
     '停停',
@@ -3880,6 +4800,14 @@ function isBargeInIntent(text) {
     '打断',
     '闭嘴',
     '错了',
+    // English interrupts; `compact` is whitespace-free and lower-cased.
+    'stop',
+    'wait',
+    'holdon',
+    'nono',
+    "that'swrong",
+    'thatswrong',
+    'nevermind',
   ];
   return keywords.some((keyword) => compact.includes(keyword));
 }
@@ -4058,6 +4986,15 @@ function AgentProgress({ progress, todos, t, running }) {
                 <li key={`${item.id}-${index}`}>
                   <Check size={13} />
                   <span>{item.label}</span>
+                  {item.preview && (
+                    <details className="tool-result-details">
+                      <summary>
+                        {t.toolResultPreview}
+                        {item.previewTruncated ? ` ${t.toolResultTruncated}` : ''}
+                      </summary>
+                      <pre>{item.preview}</pre>
+                    </details>
+                  )}
                 </li>
               ))}
             </ol>
@@ -4073,7 +5010,10 @@ function shouldAnimateTodo(status, progress, running) {
   return status === 'in_progress' && Boolean(running && progress.current);
 }
 
-function Message({ message, t, showProgress = true }) {
+const Message = React.memo(function Message({ message, t, showProgress = true }) {
+  if (message.kind === 'divider') {
+    return <div className="feed-divider" role="separator"><span>{message.content}</span></div>;
+  }
   const hasVoiceTtsPreparing = Boolean(message.role === 'assistant' && message.kind === 'message' && message.voiceTtsPreparing);
   const hasThinking = Boolean(
     message.role === 'assistant' &&
@@ -4089,13 +5029,21 @@ function Message({ message, t, showProgress = true }) {
         message.progress?.summary ||
         (message.todos?.length || 0) > 0),
   );
+  const hasHeartbeat = Boolean(
+    message.role === 'assistant' &&
+      message.kind === 'message' &&
+      message.heartbeatSec !== null &&
+      message.heartbeatSec !== undefined &&
+      !String(message.content || '').trim(),
+  );
   if (
     message.role === 'assistant' &&
     message.kind === 'message' &&
     !String(message.content || '').trim() &&
     !hasVoiceTtsPreparing &&
     !hasThinking &&
-    !hasInlineProgress
+    !hasInlineProgress &&
+    !hasHeartbeat
   ) {
     return null;
   }
@@ -4136,6 +5084,17 @@ function Message({ message, t, showProgress = true }) {
       <span className="assistant-processing-text">{t.voiceTtsPreparing}</span>
     </div>
   ) : null;
+  const heartbeatNode = hasHeartbeat ? (
+    <div className="assistant-heartbeat">
+      <span className="activity-pulse" aria-hidden="true" />
+      <span>{format(t.heartbeatWaiting, { seconds: message.heartbeatSec })}</span>
+    </div>
+  ) : null;
+  const usageNode = message.usage ? (
+    <div className="message-usage">
+      {format(t.usageLine, { input: message.usage.inputTokens ?? 0, output: message.usage.outputTokens ?? 0 })}
+    </div>
+  ) : null;
   const contentNode = <MarkdownContent content={message.content} />;
   const progressFirst = hasInlineProgress || message.contentPlacement === 'afterProgress';
   return (
@@ -4148,9 +5107,11 @@ function Message({ message, t, showProgress = true }) {
           <>
             {thinkingNode}
             {voiceTtsPreparingNode}
+            {heartbeatNode}
             {progressFirst && progressNode}
             {contentNode}
             {!progressFirst && progressNode}
+            {usageNode}
           </>
         ) : (
           message.content
@@ -4158,6 +5119,73 @@ function Message({ message, t, showProgress = true }) {
       </div>
     </article>
   );
+});
+
+function ApprovalToolInput({ toolName, toolInput, t }) {
+  const input = toolInput && typeof toolInput === 'object' && !Array.isArray(toolInput) ? toolInput : {};
+  const command = toolName === 'shell' ? String(input.command || '') : '';
+  const diff = useMemo(() => {
+    if (toolName === 'write_file') return buildApprovalDiff('', String(input.content || ''), t);
+    if (toolName === 'edit_file') return buildApprovalDiff(String(input.old || ''), String(input.new || ''), t);
+    return null;
+  }, [toolName, input.content, input.old, input.new, t]);
+  const rest = { ...input };
+  if (command) delete rest.command;
+  if (diff) {
+    delete rest.content;
+    delete rest.old;
+    delete rest.new;
+  }
+  const restKeys = Object.keys(rest);
+  return (
+    <details open>
+      <summary>{t.toolInput}</summary>
+      {command && <pre className="approval-shell-command">{command}</pre>}
+      {diff && (
+        <div className="approval-diff" aria-label={t.toolInput}>
+          {diff.map((row, index) => (
+            <div key={`${row.kind}-${index}`} className={row.kind}>
+              {row.text}
+            </div>
+          ))}
+        </div>
+      )}
+      {(restKeys.length > 0 || (!command && !diff)) && <pre>{JSON.stringify(rest, null, 2)}</pre>}
+    </details>
+  );
+}
+
+const APPROVAL_DIFF_MAX_ROWS = 200;
+const APPROVAL_DIFF_MAX_CHARS = 20000;
+
+function buildApprovalDiff(oldText, newText, t) {
+  // diffLines is O(n*m); on a large file it freezes the tab for seconds while the user is
+  // waiting to approve. Report the sizes instead of computing a diff nobody can read.
+  if (oldText.length > APPROVAL_DIFF_MAX_CHARS || newText.length > APPROVAL_DIFF_MAX_CHARS) {
+    const template = t?.diffTooLarge || TRANSLATIONS.zh.diffTooLarge;
+    return [{ kind: 'elided', text: format(template, { old: oldText.length, new: newText.length }) }];
+  }
+  const rows = [];
+  let parts;
+  try {
+    parts = diffLines(oldText, newText);
+  } catch {
+    return null;
+  }
+  for (const part of parts) {
+    const kind = part.added ? 'added' : part.removed ? 'removed' : 'context';
+    const marker = part.added ? '+' : part.removed ? '-' : ' ';
+    const lines = String(part.value || '').split('\n');
+    if (lines.length > 1 && lines[lines.length - 1] === '') lines.pop();
+    for (const line of lines) {
+      rows.push({ kind, text: `${marker} ${line}` });
+      if (rows.length >= APPROVAL_DIFF_MAX_ROWS) {
+        rows.push({ kind: 'elided', text: '…' });
+        return rows;
+      }
+    }
+  }
+  return rows;
 }
 
 function AgentDialogue({ message }) {
@@ -4235,21 +5263,70 @@ function ThinkingBlock({ content, running, t }) {
   );
 }
 
-function MarkdownContent({ content }) {
-  const normalizedContent = normalizeMarkdownForDisplay(content || '');
+const MarkdownContent = React.memo(function MarkdownContent({ content }) {
+  const normalizedContent = useMemo(() => normalizeMarkdownForDisplay(content || ''), [content]);
+  const needsMath = MATH_MARKUP_PATTERN.test(normalizedContent);
+  const needsHighlight = CODE_FENCE_PATTERN.test(normalizedContent);
+  const [mathPlugins, setMathPlugins] = useState(mathPluginsCache);
+  const [highlightPlugin, setHighlightPlugin] = useState(highlightPluginCache);
+
+  useEffect(() => {
+    if (!needsMath || mathPlugins) return undefined;
+    let cancelled = false;
+    loadMathPlugins()
+      .then((plugins) => {
+        if (!cancelled) setMathPlugins(plugins);
+      })
+      .catch(() => {
+        // Math rendering stays plain text if the chunk cannot be fetched.
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, [needsMath, mathPlugins]);
+
+  useEffect(() => {
+    if (!needsHighlight || highlightPlugin) return undefined;
+    let cancelled = false;
+    loadHighlightPlugin()
+      .then((plugin) => {
+        if (!cancelled) setHighlightPlugin(plugin);
+      })
+      .catch(() => {
+        // Code blocks stay unhighlighted if the chunk cannot be fetched.
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, [needsHighlight, highlightPlugin]);
+
+  const useMath = needsMath && Boolean(mathPlugins);
+  const useHighlight = needsHighlight && Boolean(highlightPlugin);
+  const remarkPlugins = useMemo(
+    () => (useMath ? [remarkGfm, mathPlugins.remarkMath] : BASE_REMARK_PLUGINS),
+    [useMath, mathPlugins],
+  );
+  const rehypePlugins = useMemo(() => {
+    if (!useMath && !useHighlight) return EMPTY_REHYPE_PLUGINS;
+    const plugins = [];
+    if (useMath) plugins.push(mathPlugins.rehypeKatex);
+    if (useHighlight) plugins.push(highlightPlugin);
+    return plugins;
+  }, [useMath, useHighlight, mathPlugins, highlightPlugin]);
+
   if (!normalizedContent.trim()) return null;
   return (
     <div className="markdown-body">
       <ReactMarkdown
-        remarkPlugins={[remarkGfm, remarkMath]}
-        rehypePlugins={[rehypeKatex]}
+        remarkPlugins={remarkPlugins}
+        rehypePlugins={rehypePlugins}
         components={{ pre: MermaidPre, table: MarkdownTable }}
       >
         {normalizedContent}
       </ReactMarkdown>
     </div>
   );
-}
+});
 
 function MarkdownTable({ children, ...props }) {
   return (
@@ -4259,6 +5336,19 @@ function MarkdownTable({ children, ...props }) {
   );
 }
 
+// navigator.clipboard rejects on http origins, when the document is not focused, and when
+// the permission is denied; an unhandled rejection there left the user with no feedback.
+async function copyTextToClipboard(text) {
+  try {
+    await navigator.clipboard.writeText(text);
+    return true;
+  } catch (err) {
+    const template = activeTranslations?.copyFailed || 'Copy failed: {error}';
+    emitToast({ message: format(template, { error: err?.message || String(err) }), tone: 'error' });
+    return false;
+  }
+}
+
 function MermaidPre({ children, ...props }) {
   const child = React.Children.toArray(children)[0];
   const className = child?.props?.className || '';
@@ -4266,13 +5356,27 @@ function MermaidPre({ children, ...props }) {
     const chart = React.Children.toArray(child.props.children).join('');
     return <MermaidDiagram chart={chart} />;
   }
-  return <pre {...props}>{children}</pre>;
+  const code = React.Children.toArray(child?.props?.children).join('').replace(/\n$/, '');
+  const language = className.match(/language-([\w-]+)/)?.[1] || 'text';
+  return (
+    <div className="code-block">
+      <div className="code-block-toolbar">
+        <span>{language}</span>
+        <button type="button" onClick={() => void copyTextToClipboard(code)} aria-label="Copy code" title="Copy code">
+          <Copy size={14} />
+        </button>
+      </div>
+      <pre {...props}>{children}</pre>
+    </div>
+  );
 }
 
 function MermaidDiagram({ chart, title }) {
   const [svg, setSvg] = useState('');
   const [error, setError] = useState('');
+  const [themeDark, setThemeDark] = useState(effectiveDarkTheme);
   const diagramId = useMemo(() => `mermaid-${crypto.randomUUID().replace(/-/g, '')}`, []);
+  useEffect(() => subscribeThemeChange(setThemeDark), []);
   useEffect(() => {
     let cancelled = false;
     const source = normalizeMermaidForRender(chart);
@@ -4281,22 +5385,28 @@ function MermaidDiagram({ chart, title }) {
       setError('');
       return;
     }
-    loadMermaid()
-      .then((instance) => instance.render(diagramId, source))
-      .then((result) => {
-        if (cancelled) return;
-        setSvg(result.svg);
-        setError('');
-      })
-      .catch((err) => {
-        if (cancelled) return;
-        setSvg('');
-        setError(err?.message || String(err));
-      });
+    const timer = window.setTimeout(() => {
+      loadMermaid(themeDark)
+        .then(async (instance) => {
+          await instance.parse(source);
+          return instance.render(diagramId, source);
+        })
+        .then((result) => {
+          if (cancelled) return;
+          setSvg(result.svg);
+          setError('');
+        })
+        .catch((err) => {
+          if (cancelled) return;
+          setSvg('');
+          setError(err?.message || String(err));
+        });
+    }, 300);
     return () => {
       cancelled = true;
+      window.clearTimeout(timer);
     };
-  }, [chart, diagramId]);
+  }, [chart, diagramId, themeDark]);
 
   return (
     <figure className="mermaid-card">
@@ -4380,8 +5490,33 @@ function normalizeMathMarkdown(content) {
     .replace(/\\\((.+?)\\\)/g, (_match, math) => `$${math.trim()}$`);
 }
 
+// Every compressed-table candidate needs a line carrying at least four pipes. Scanning for
+// that is O(n) and lets the whole (much more expensive) normalization be skipped for the
+// overwhelming majority of messages, which carry no table at all.
+// Native indexOf scans only: a per-character JS loop over a long message costs more than
+// the normalization it is meant to avoid.
+function hasCompressedTableCandidateLine(content) {
+  let pipes = 0;
+  let searchFrom = 0;
+  let lineEnd = -1;
+  for (;;) {
+    const pipeAt = content.indexOf('|', searchFrom);
+    if (pipeAt < 0) return false;
+    if (pipeAt > lineEnd) {
+      lineEnd = content.indexOf('\n', pipeAt);
+      if (lineEnd < 0) lineEnd = content.length;
+      pipes = 0;
+    }
+    pipes += 1;
+    if (pipes >= 4) return true;
+    searchFrom = pipeAt + 1;
+  }
+}
+
 function normalizeCompressedMarkdownTables(content) {
-  const lines = normalizeMultilineCompressedMarkdownTables(String(content || '')).split('\n');
+  const source = String(content || '');
+  if (!hasCompressedTableCandidateLine(source)) return source;
+  const lines = normalizeMultilineCompressedMarkdownTables(source).split('\n');
   const normalizedLines = lines.flatMap((line) => {
     const splitRows = splitCompressedMarkdownTableLine(line);
     return splitRows.length ? splitRows : [line];
@@ -4392,31 +5527,46 @@ function normalizeCompressedMarkdownTables(content) {
 function normalizeMultilineCompressedMarkdownTables(content) {
   const lines = String(content || '').split('\n');
   const normalizedLines = [];
+  let insideStandardTable = false;
   for (let index = 0; index < lines.length; index += 1) {
     const line = lines[index];
+    // Rows of an already well-formed table pass through untouched: re-parsing them as a
+    // compressed table infers the wrong column count and destroys the table.
+    if (insideStandardTable) {
+      if (typeof line === 'string' && line.includes('|')) {
+        normalizedLines.push(line);
+        continue;
+      }
+      insideStandardTable = false;
+    }
     if (!isCompressedMarkdownTableStart(line)) {
+      if (startsStandardMarkdownTable(lines, index)) insideStandardTable = true;
+      normalizedLines.push(line);
+      continue;
+    }
+    if (startsStandardMarkdownTable(lines, index)) {
+      insideStandardTable = true;
       normalizedLines.push(line);
       continue;
     }
 
-    const block = [line];
+    const accumulator = createCompressedTableAccumulator(line);
     let cursor = index + 1;
     while (cursor < lines.length) {
-      const joined = block.join(' ');
-      const table = parseCompressedMarkdownTable(joined);
+      const table = accumulator.status();
       const nextLine = lines[cursor];
       const nextTrimmed = String(nextLine || '').trim();
       if (table?.isComplete && !nextTrimmed.startsWith('|')) break;
       if (!nextTrimmed && table) break;
-      block.push(nextLine);
+      accumulator.append(nextLine);
       cursor += 1;
-      if (parseCompressedMarkdownTable(block.join(' '))?.isComplete) {
+      if (accumulator.status()?.isComplete) {
         const nextAfterBlock = String(lines[cursor] || '').trim();
         if (!nextAfterBlock.startsWith('|')) break;
       }
     }
 
-    const table = parseCompressedMarkdownTable(block.join(' '));
+    const table = accumulator.table();
     if (!table) {
       normalizedLines.push(line);
       continue;
@@ -4427,9 +5577,45 @@ function normalizeMultilineCompressedMarkdownTables(content) {
   return normalizedLines.join('\n');
 }
 
+// Cells of a single markdown table row, with the optional outer pipes removed. Escaped
+// pipes (\|) are cell content, not separators.
+function markdownRowCells(line) {
+  const trimmed = String(line ?? '').trim();
+  if (!trimmed.includes('|')) return null;
+  const cells = trimmed.split(/(?<!\\)\|/);
+  if (cells.length && cells[0].trim() === '') cells.shift();
+  if (cells.length && cells[cells.length - 1].trim() === '') cells.pop();
+  return cells.length ? cells : null;
+}
+
+// A GFM delimiter row: every cell is one or more dashes with optional alignment colons
+// (`| --- |`, `|---|`, `|:---|:-:|--:|`). Such a row always belongs to a standard table.
+function isMarkdownTableDelimiterLine(line) {
+  const cells = markdownRowCells(line);
+  if (!cells || cells.length < 2) return false;
+  return cells.every((cell) => /^\s*:?-+:?\s*$/.test(cell));
+}
+
+// A header row followed by a delimiter row of the same width is a standard table already.
+function startsStandardMarkdownTable(lines, index) {
+  const next = lines[index + 1];
+  // Cheap reject first: this runs once per line of every rendered message.
+  if (typeof next !== 'string' || !next.includes('|') || !next.includes('-')) return false;
+  const headerCells = markdownRowCells(lines[index]);
+  if (!headerCells || headerCells.length < 2) return false;
+  if (isMarkdownTableDelimiterLine(lines[index])) return false;
+  const delimiterCells = markdownRowCells(lines[index + 1]);
+  if (!delimiterCells || delimiterCells.length !== headerCells.length) return false;
+  return isMarkdownTableDelimiterLine(lines[index + 1]);
+}
+
 function isCompressedMarkdownTableStart(line) {
   const value = String(line || '');
-  return (value.match(/\|/g) || []).length >= 4 && /\|\s*:?-{3,}:?\s*\|/.test(value);
+  if ((value.match(/\|/g) || []).length < 4) return false;
+  // A bare delimiter row is the second line of a standard table, never the start of a
+  // compressed one; treating it as a start inferred 2 columns and mangled the table.
+  if (isMarkdownTableDelimiterLine(value)) return false;
+  return /\|\s*:?-{3,}:?\s*\|/.test(value);
 }
 
 function splitCompressedMarkdownTableLine(line) {
@@ -4440,6 +5626,7 @@ function splitCompressedMarkdownTableLine(line) {
 function parseCompressedMarkdownTable(line) {
   const value = String(line || '');
   if ((value.match(/\|/g) || []).length < 6) return null;
+  if (isMarkdownTableDelimiterLine(value)) return null;
   const firstPipe = value.indexOf('|');
   if (firstPipe < 0) return null;
   const prefix = value.slice(0, firstPipe).trimEnd();
@@ -4448,8 +5635,87 @@ function parseCompressedMarkdownTable(line) {
     .split('|')
     .slice(1)
     .filter((cell) => cell.trim() !== '');
-  if (rawCells.length && !rawCells[rawCells.length - 1].trim()) rawCells.pop();
+  return parseCompressedMarkdownCells(prefix, rawCells);
+}
+
+function createCompressedTableAccumulator(line) {
+  const value = String(line || '');
+  const firstPipe = value.indexOf('|');
+  const prefix = firstPipe >= 0 ? value.slice(0, firstPipe).trimEnd() : '';
+  const rawCells = [];
+  let pending = '';
+  // Layout (column count + separator run) never changes once it is fully visible,
+  // so it is detected once and reused instead of re-parsing every cell per line.
+  let layout = null;
+  let layoutScanFrom = 1;
+
+  function append(fragment, initial = false) {
+    const source = `${pending}${initial ? '' : ' '}${initial ? String(fragment).slice(firstPipe + 1) : String(fragment)}`;
+    const parts = source.split('|');
+    pending = parts.pop() || '';
+    rawCells.push(...parts.filter((cell) => cell.trim() !== ''));
+  }
+
+  function cellCount() {
+    return rawCells.length + (pending.trim() ? 1 : 0);
+  }
+
+  function cellAt(index) {
+    return index < rawCells.length ? rawCells[index] : index === rawCells.length && pending.trim() ? pending : undefined;
+  }
+
+  function detectLayout() {
+    if (layout) return layout;
+    const total = cellCount();
+    for (let index = Math.max(1, layoutScanFrom); index < total; index += 1) {
+      let separatorCount = 0;
+      while (isMarkdownTableSeparatorCell(cellAt(index + separatorCount))) separatorCount += 1;
+      if (separatorCount >= 1 && index >= 2) {
+        // Only cache once the cell after the separator run has arrived, otherwise a
+        // half-streamed run would freeze the wrong separator length.
+        const settled = index + separatorCount < total;
+        const candidate = { columnCount: index, separatorStart: index, separatorCellCount: separatorCount };
+        if (settled) layout = candidate;
+        return candidate;
+      }
+    }
+    layoutScanFrom = Math.max(1, total - 1);
+    return null;
+  }
+
+  function status() {
+    const found = detectLayout();
+    if (!found) return null;
+    const total = cellCount();
+    if (total < found.columnCount * 2) return null;
+    const dataCount = total - found.separatorStart - found.separatorCellCount;
+    return { isComplete: dataCount >= found.columnCount && dataCount % found.columnCount === 0 };
+  }
+
+  function table() {
+    const found = detectLayout();
+    if (!found) return null;
+    const cells = pending.trim() ? [...rawCells, pending] : rawCells;
+    if (cells.length < found.columnCount * 2) return null;
+    const dataCount = cells.length - found.separatorStart - found.separatorCellCount;
+    return {
+      prefix,
+      columnCount: found.columnCount,
+      headerCells: cells.slice(0, found.columnCount),
+      dataCells: cells.slice(found.separatorStart + found.separatorCellCount),
+      isComplete: dataCount >= found.columnCount && dataCount % found.columnCount === 0,
+    };
+  }
+
+  append(value, true);
+  return { append, status, table };
+}
+
+function parseCompressedMarkdownCells(prefix, rawCells) {
   if (rawCells.length < 4) return null;
+  // Nothing but delimiter cells means the caller handed over a standard table's delimiter
+  // row; inferring a column count from it would fabricate a bogus 2-column table.
+  if (rawCells.every((cell) => /^\s*:?-+:?\s*$/.test(cell))) return null;
 
   let columnCount = 0;
   let separatorCellCount = 0;
@@ -4515,83 +5781,65 @@ function isLikelyStreamingMarkdownTableRow(line) {
   return /\|\s*[^|\s][^|]*$/.test(trimmed);
 }
 
-function DirectoryPicker({ data, error, loading, selectedPath, t, onClose, onLoad, onSelect, onUse, busy }) {
-  const roots = data?.roots || [];
-  const directories = data?.directories || [];
-  return (
-    <div className="modal-backdrop" role="dialog" aria-modal="true" aria-label={t.directoryPickerTitle}>
-      <section className="directory-dialog">
-        <header className="directory-header">
-          <div>
-            <strong>{t.directoryPickerTitle}</strong>
-            <span>{data?.path || t.loadingDirectories}</span>
-          </div>
-          <button type="button" className="icon-button" onClick={onClose} aria-label={t.close}>
-            <X size={17} />
-          </button>
-        </header>
 
-        <div className="directory-jumpbar">
-          {data?.parent && (
-            <button type="button" onClick={() => onLoad(data.parent)}>
-              {t.parentDirectory}
-            </button>
-          )}
-          {roots.map((root) => (
-            <button type="button" key={root.path} onClick={() => onLoad(root.path)}>
-              {root.path === data?.home ? t.homeDirectory : root.path === data?.workspace ? t.currentDirectory : root.name}
-            </button>
-          ))}
-        </div>
+// A 403 means this page is holding a token the server no longer accepts —
+// normally because the server restarted while the tab stayed open. The token
+// lives in the served HTML, so a reload is the whole fix. Reload once (guarded
+// by sessionStorage so a genuinely rejected client cannot loop), and tell the
+// user plainly if that did not help.
+const STALE_TOKEN_RELOAD_KEY = 'langcode-stale-token-reload';
 
-        {error && (
-          <div className="directory-error">
-            <CircleAlert size={15} />
-            {error}
-          </div>
-        )}
+const STALE_TOKEN_FALLBACK_MESSAGE =
+  'The server rejected this page (unauthorized). Reload the page; if it keeps failing, restart the server.';
 
-        <div className="directory-list">
-          {loading && <div className="directory-empty">{t.loadingDirectories}</div>}
-          {!loading && directories.length === 0 && <div className="directory-empty">{t.noDirectories}</div>}
-          {!loading &&
-            directories.map((directory) => (
-              <button
-                type="button"
-                key={directory.path}
-                className={directory.path === selectedPath ? 'selected' : ''}
-                onClick={() => onSelect(directory.path)}
-                onDoubleClick={() => onLoad(directory.path)}
-              >
-                <Folder size={16} />
-                <span>{directory.name}</span>
-              </button>
-            ))}
-        </div>
+function staleTokenMessage() {
+  return activeTranslations?.staleTokenReloadFailed || STALE_TOKEN_FALLBACK_MESSAGE;
+}
 
-        <footer className="directory-footer">
-          <label>
-            <span>{t.selectedDirectory}</span>
-            <input value={selectedPath || ''} readOnly />
-          </label>
-          <button type="button" onClick={() => onUse(selectedPath)} disabled={busy || !selectedPath}>
-            {t.useThisDirectory}
-          </button>
-        </footer>
-      </section>
-    </div>
-  );
+function markAuthorizedRequest() {
+  try {
+    window.sessionStorage.removeItem(STALE_TOKEN_RELOAD_KEY);
+  } catch {
+    // Nothing to clear when storage is unavailable.
+  }
+}
+
+function handleUnauthorizedResponse(response) {
+  if (!response || response.status !== 403) {
+    if (response?.ok) markAuthorizedRequest();
+    return false;
+  }
+  let alreadyReloaded = false;
+  try {
+    alreadyReloaded = window.sessionStorage.getItem(STALE_TOKEN_RELOAD_KEY) === '1';
+  } catch {
+    alreadyReloaded = false;
+  }
+  if (alreadyReloaded) {
+    emitToast({ tone: 'error', fatal: true, message: staleTokenMessage() });
+    return true;
+  }
+  try {
+    window.sessionStorage.setItem(STALE_TOKEN_RELOAD_KEY, '1');
+  } catch {
+    // Private mode: reloading once is still the right move.
+  }
+  window.location.reload();
+  return true;
 }
 
 async function api(path, body) {
   const options = body
     ? {
         method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
+        headers: { ...API_HEADERS, 'Content-Type': 'application/json' },
         body: JSON.stringify(body),
       }
-    : undefined;
+    : { headers: API_HEADERS };
   const response = await fetch(path, options);
+  if (handleUnauthorizedResponse(response)) {
+    return { ok: false, error: staleTokenMessage() };
+  }
   return response.json();
 }
 

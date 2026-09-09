@@ -5,6 +5,8 @@ import asyncio
 import base64
 import json
 from pathlib import Path
+import threading
+import time
 from typing import Any
 from urllib.parse import unquote
 
@@ -13,6 +15,7 @@ from sanic.request import Request
 
 from ..core.config import load_env_files
 from ..voice.asr import QwenAsrService, websocket_asr_loop
+from ..voice.stream import TtsTurnRegistry, iter_tts_events
 from ..voice.tts import TtsService, content_type_for_path
 from ..voice.turnsense import TurnSenseService
 
@@ -24,6 +27,9 @@ class VoiceWorker:
         self.turnsense = TurnSenseService()
         self.asr = QwenAsrService(turnsense=self.turnsense)
         self.tts = TtsService()
+        # This process owns the producer when a web process proxies to it, so it
+        # also owns the barge-in bookkeeping (same class as web.py uses).
+        self.tts_turns = TtsTurnRegistry()
 
     def start_preload(self) -> None:
         self.asr.start_preload()
@@ -119,48 +125,61 @@ def create_voice_worker_app(worker: VoiceWorker) -> Sanic:
         payload = _request_json(request)
         text = str(payload.get("text") or "")
         voice_id = str(payload.get("voiceId") or "")
+        session_id = str(payload.get("sessionId") or "")
+        turn_id = str(payload.get("turnId") or "")
+        # A newer turn of the same session supersedes this one; the producer
+        # notices between chunks. Same rule as web.py's local endpoint.
+        worker.tts_turns.claim(session_id, turn_id)
 
         async def stream(streaming_response):
+            started_at = time.perf_counter()
             event_queue: asyncio.Queue[dict[str, Any] | None] = asyncio.Queue()
             loop = asyncio.get_running_loop()
+            disconnected = threading.Event()
+
+            def should_stop() -> bool:
+                return disconnected.is_set() or worker.tts_turns.is_stale(session_id, turn_id)
 
             def produce_audio() -> None:
                 try:
-                    for index, (audio, content_type) in enumerate(
-                        worker.tts.synthesize_chunks(text, voice_id=voice_id),
-                        start=1,
+                    for event in iter_tts_events(
+                        worker.tts,
+                        text,
+                        voice_id=voice_id,
+                        should_stop=should_stop,
+                        turn_id=turn_id,
+                        started_at=started_at,
                     ):
-                        loop.call_soon_threadsafe(
-                            event_queue.put_nowait,
-                            {
-                                "type": "audio",
-                                "index": index,
-                                "contentType": content_type,
-                                "audio": base64.b64encode(audio).decode("ascii"),
-                            },
-                        )
-                    loop.call_soon_threadsafe(event_queue.put_nowait, {"type": "done", "ok": True})
-                except Exception as exc:
-                    loop.call_soon_threadsafe(
-                        event_queue.put_nowait,
-                        {"type": "error", "ok": False, "error": f"{type(exc).__name__}: {exc}"},
-                    )
+                        loop.call_soon_threadsafe(event_queue.put_nowait, event)
                 finally:
                     loop.call_soon_threadsafe(event_queue.put_nowait, None)
 
             producer = asyncio.create_task(asyncio.to_thread(produce_audio))
-            while True:
-                event = await event_queue.get()
-                if event is None:
-                    break
-                await streaming_response.write(json.dumps(event, ensure_ascii=False).encode("utf-8") + b"\n")
-            await producer
+            try:
+                while True:
+                    event = await event_queue.get()
+                    if event is None:
+                        break
+                    await streaming_response.write(json.dumps(event, ensure_ascii=False).encode("utf-8") + b"\n")
+                await producer
+            except (asyncio.CancelledError, ConnectionError, BrokenPipeError):
+                # The web process dropped the upstream connection: stop
+                # synthesizing instead of speaking into a dead socket.
+                disconnected.set()
+                raise
 
         return response.ResponseStream(
             stream,
             content_type="application/x-ndjson; charset=utf-8",
             headers={"Cache-Control": "no-cache"},
         )
+
+    @sanic_app.post("/api/tts/cancel")
+    async def tts_cancel(request: Request):
+        payload = _request_json(request)
+        if not worker.tts_turns.cancel(payload.get("sessionId"), payload.get("turnId")):
+            return response.json({"ok": False, "error": "Session id and turn id are required"}, status=400)
+        return response.json({"ok": True})
 
     @sanic_app.websocket("/api/asr/stream")
     async def asr_stream(_request: Request, ws):

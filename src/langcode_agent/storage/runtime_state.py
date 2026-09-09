@@ -78,11 +78,12 @@ class RuntimeStateStore:
         self._memory_active: dict[str, dict[str, Any]] = {}
         self._redis: Any | None = None
         self._redis_error = ""
+        self._redis_disabled_until = 0.0
         self._connect_redis()
 
     @property
     def redis_available(self) -> bool:
-        return self._redis is not None
+        return self._redis_client() is not None
 
     def status(self) -> dict:
         state = RuntimeStateStatus(
@@ -101,21 +102,29 @@ class RuntimeStateStore:
     def cancel_run(self, session_id: str, run_id: str, *, ttl_seconds: int = 24 * 60 * 60) -> None:
         if not session_id or not run_id:
             return
-        if self._redis is not None:
+        with self._memory_lock:
+            self._memory_cancelled.setdefault(session_id, set()).add(run_id)
+        client = self._redis_client()
+        if client is not None:
             try:
-                self._redis.set(self._key("cancelled", session_id, run_id), "1", ex=ttl_seconds)
+                client.set(self._key("cancelled", session_id, run_id), "1", ex=ttl_seconds)
                 return
             except Exception as exc:
                 self._disable_redis(exc)
+
+    def is_run_cancelled_local(self, session_id: str, run_id: str | None) -> bool:
+        if not session_id or not run_id:
+            return False
         with self._memory_lock:
-            self._memory_cancelled.setdefault(session_id, set()).add(run_id)
+            return run_id in self._memory_cancelled.get(session_id, set())
 
     def is_run_cancelled(self, session_id: str, run_id: str | None) -> bool:
         if not session_id or not run_id:
             return False
-        if self._redis is not None:
+        client = self._redis_client()
+        if client is not None:
             try:
-                return bool(self._redis.exists(self._key("cancelled", session_id, run_id)))
+                return bool(client.exists(self._key("cancelled", session_id, run_id)))
             except Exception as exc:
                 self._disable_redis(exc)
         with self._memory_lock:
@@ -124,44 +133,46 @@ class RuntimeStateStore:
     def forget_cancelled_run(self, session_id: str, run_id: str | None) -> None:
         if not session_id or not run_id:
             return
-        if self._redis is not None:
+        with self._memory_lock:
+            cancelled = self._memory_cancelled.get(session_id)
+            if cancelled:
+                cancelled.discard(run_id)
+                if not cancelled:
+                    self._memory_cancelled.pop(session_id, None)
+        client = self._redis_client()
+        if client is not None:
             try:
-                self._redis.delete(self._key("cancelled", session_id, run_id))
+                client.delete(self._key("cancelled", session_id, run_id))
                 return
             except Exception as exc:
                 self._disable_redis(exc)
-        with self._memory_lock:
-            cancelled = self._memory_cancelled.get(session_id)
-            if not cancelled:
-                return
-            cancelled.discard(run_id)
-            if not cancelled:
-                self._memory_cancelled.pop(session_id, None)
 
     def clear_session(self, session_id: str) -> None:
         if not session_id:
             return
-        if self._redis is not None:
-            try:
-                keys = list(self._redis.scan_iter(self._key("cancelled", session_id, "*")))
-                keys.extend(list(self._redis.scan_iter(self._key("active", session_id, "*"))))
-                keys.append(self._key("lock", session_id))
-                if keys:
-                    self._redis.delete(*keys)
-                return
-            except Exception as exc:
-                self._disable_redis(exc)
         with self._memory_lock:
             self._memory_cancelled.pop(session_id, None)
             self._memory_active.pop(session_id, None)
+        client = self._redis_client()
+        if client is not None:
+            try:
+                keys = list(client.scan_iter(self._key("cancelled", session_id, "*")))
+                keys.extend(list(client.scan_iter(self._key("active", session_id, "*"))))
+                keys.append(self._key("lock", session_id))
+                if keys:
+                    client.delete(*keys)
+                return
+            except Exception as exc:
+                self._disable_redis(exc)
 
     def mark_run_started(self, session_id: str, run_id: str | None, *, ttl_seconds: int = 2 * 60 * 60) -> None:
         if not session_id or not run_id:
             return
         payload = {"runId": run_id, "startedAt": time.time()}
-        if self._redis is not None:
+        client = self._redis_client()
+        if client is not None:
             try:
-                self._redis.set(self._key("active", session_id, run_id), _json_dumps(payload), ex=ttl_seconds)
+                client.set(self._key("active", session_id, run_id), _json_dumps(payload), ex=ttl_seconds)
                 return
             except Exception as exc:
                 self._disable_redis(exc)
@@ -171,9 +182,10 @@ class RuntimeStateStore:
     def mark_run_finished(self, session_id: str, run_id: str | None) -> None:
         if not session_id or not run_id:
             return
-        if self._redis is not None:
+        client = self._redis_client()
+        if client is not None:
             try:
-                self._redis.delete(self._key("active", session_id, run_id))
+                client.delete(self._key("active", session_id, run_id))
                 return
             except Exception as exc:
                 self._disable_redis(exc)
@@ -182,6 +194,21 @@ class RuntimeStateStore:
             if active and active.get("runId") == run_id:
                 self._memory_active.pop(session_id, None)
 
+    def has_active_run(self, session_id: str) -> bool:
+        """True when any run is currently executing for the session (any worker)."""
+        if not session_id:
+            return False
+        client = self._redis_client()
+        if client is not None:
+            try:
+                for _key in client.scan_iter(self._key("active", session_id, "*"), count=10):
+                    return True
+                return False
+            except Exception as exc:
+                self._disable_redis(exc)
+        with self._memory_lock:
+            return session_id in self._memory_active
+
     def acquire_session_lock(
         self,
         session_id: str,
@@ -189,7 +216,8 @@ class RuntimeStateStore:
         wait_timeout_seconds: float = 30.0,
         ttl_seconds: int = 2 * 60 * 60,
     ) -> RuntimeLease:
-        if self._redis is None or not session_id:
+        client = self._redis_client()
+        if client is None or not session_id:
             return RuntimeLease(self, "", "", False)
         key = self._key("lock", session_id)
         token = uuid4().hex
@@ -197,7 +225,7 @@ class RuntimeStateStore:
         sleep_seconds = 0.05
         while time.monotonic() < deadline:
             try:
-                if self._redis.set(key, token, nx=True, ex=ttl_seconds):
+                if client.set(key, token, nx=True, ex=ttl_seconds):
                     return RuntimeLease(self, key, token, True)
             except Exception as exc:
                 self._disable_redis(exc)
@@ -207,7 +235,8 @@ class RuntimeStateStore:
         raise RuntimeLockTimeout(f"Session {session_id} is busy")
 
     def _release_redis_lock(self, key: str, token: str) -> None:
-        if self._redis is None or not key:
+        client = self._redis_client()
+        if client is None or not key:
             return
         script = """
 if redis.call("GET", KEYS[1]) == ARGV[1] then
@@ -216,12 +245,12 @@ end
 return 0
 """
         try:
-            self._redis.eval(script, 1, key, token)
+            client.eval(script, 1, key, token)
         except Exception:
             try:
-                value = self._redis.get(key)
+                value = client.get(key)
                 if _decode(value) == token:
-                    self._redis.delete(key)
+                    client.delete(key)
             except Exception as exc:
                 self._disable_redis(exc)
 
@@ -246,11 +275,25 @@ return 0
             client.ping()
             self._redis = client
             self._redis_error = ""
+            self._redis_disabled_until = 0.0
         except Exception as exc:
             self._redis = None
             self._redis_error = f"redis unavailable: {exc}"
+            self._redis_disabled_until = time.monotonic() + 5.0
             if _truthy(self.enabled):
                 raise RuntimeError(self._redis_error) from exc
+
+    def _redis_client(self) -> Any | None:
+        if (
+            self._redis is None
+            and not _falsy(self.enabled)
+            and time.monotonic() >= self._redis_disabled_until
+        ):
+            try:
+                self._connect_redis()
+            except RuntimeError:
+                pass
+        return self._redis
 
     def _key(self, *parts: str) -> str:
         escaped = [str(part).replace(":", "_") for part in parts]
@@ -259,6 +302,7 @@ return 0
     def _disable_redis(self, exc: Exception) -> None:
         self._redis = None
         self._redis_error = f"redis runtime failure: {exc}"
+        self._redis_disabled_until = time.monotonic() + 5.0
 
 
 def _redact_redis_url(url: str) -> str:

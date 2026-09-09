@@ -3,6 +3,10 @@ name = "langcode-agent"
 version = "0.1.0"
 description = "A LangGraph-based CLI code agent with human-in-the-loop tool approval."
 requires-python = ">=3.11"
+# Core = what the agent, the CLI and the web app import at module top level.
+# Every voice model import (torch, transformers, mlx, mlx_audio, librosa, scipy,
+# onnxruntime, silero_vad, qwen_asr, kaldi_native_fbank) is lazy, inside a
+# function, so a core-only install boots the web server with voice disabled.
 dependencies = [
   "langchain==1.3.1",
   "langgraph==1.2.0",
@@ -10,19 +14,65 @@ dependencies = [
   "langchain-core==1.4.0",
   "langchain-openai==1.2.1",
   "langchain-tavily",
-  "qwen-asr==0.0.6",
-  "transformers==4.57.6",
-  "silero-vad==6.2.1",
-  "mlx>=0.22.0; sys_platform == 'darwin'",
-  "mlx-audio>=0.2.0; sys_platform == 'darwin'",
-  "onnxruntime",
-  "kaldi-native-fbank",
-  "huggingface_hub",
-  "librosa",
-  "scipy",
-  "soundfile",
+  "tiktoken>=0.7.0",
   "sanic",
   "redis>=5.0.0",
+  # numpy/soundfile are top-level imports in voice/*.py. They are small and keep
+  # langcode_agent.interfaces.web importable without the voice extra.
+  "numpy",
+  "soundfile",
+  "huggingface_hub",
+]
+
+[project.optional-dependencies]
+# ``voice`` is the resolvable half of the speech stack. Two packages are
+# deliberately absent because their *declared* metadata can never be co-resolved
+# with the stack we actually run; both are installed with --no-deps from
+# constraints.txt by scripts/start_macos.sh (see requirements-voice-nodeps.txt):
+#
+#   * qwen-asr==0.0.6 hard-pins transformers==4.57.6 and drags in gradio, flask,
+#     accelerate, sox, pytz, qwen-omni-utils and soynlp. Its importable code only
+#     touches gradio in cli/demo.py and flask in cli/demo_streaming.py (demo UIs
+#     we never run); soynlp is imported lazily inside the Korean branch of the
+#     forced aligner. Real runtime imports are transformers, torch, librosa,
+#     soundfile, numpy and nagisa - all listed below.
+#   * mlx-audio==0.4.3 (and its mlx-lm==0.31.3 dependency) declare
+#     transformers>=5.5.0 / huggingface_hub>=1.0, which contradicts qwen-asr's
+#     transformers==4.57.6. That contradiction is what made pip walk mlx-audio
+#     down 16 releases (0.5.3 -> 0.2.10) on every install. The known-good runtime
+#     combination is 4.57.6 + mlx-audio 0.4.3, so we install it as a fact instead
+#     of asking the resolver to derive it. Its real deps (miniaudio, sounddevice,
+#     sentencepiece, protobuf, mlx, numpy, scipy, tqdm) are listed below.
+#
+#   pip install -e ".[voice]" -c constraints.txt
+#   pip install --no-deps -c constraints.txt -r requirements-voice-nodeps.txt
+voice = [
+  "transformers==4.57.6",
+  # Qwen3ASRModel loads weights with a device_map, and transformers refuses to
+  # do that without accelerate. qwen-asr pins it to ==1.12.0.
+  "accelerate==1.12.0",
+  "silero-vad==6.2.1",
+  "torch",
+  "nagisa",
+  "onnxruntime",
+  "kaldi-native-fbank",
+  "librosa",
+  "scipy",
+  # mlx-audio / mlx-lm / mlx-audio-plus runtime deps (all installed --no-deps).
+  "mlx>=0.22.0; sys_platform == 'darwin'",
+  "miniaudio; sys_platform == 'darwin'",
+  "sounddevice; sys_platform == 'darwin'",
+  "sentencepiece; sys_platform == 'darwin'",
+  "protobuf",
+  "tqdm",
+  # einops is a top-level import of several mlx_audio.codec modules that the
+  # cosyvoice3 load path reaches. It is declared only in mlx-audio-plus's `tts`
+  # extra, which --no-deps skips, so without this line loading the model fails
+  # with ModuleNotFoundError: No module named 'einops'.
+  "einops",
+]
+dev = [
+  "pytest",
 ]
 
 [project.scripts]

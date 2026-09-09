@@ -11,7 +11,7 @@ from langchain_openai import ChatOpenAI
 from ..core._compat import patch_langchain_debug
 from .agent import CodeAgent
 from ..core.config import load_env_files
-from ..core.context_management import compact_tool_result, make_json_safe
+from ..core.context_management import compact_history_if_needed, compact_tool_result, make_json_safe
 from .delegation import delegate_tool_schema, run_delegate_agent
 from .multi_agent import (
     agent_debate_tool_schema,
@@ -30,6 +30,8 @@ WEB_SEARCH_LIMIT_MOCK_USER = (
     "直接回答我最初的问题；如果信息不足，也请说明依据和不确定性。"
 )
 WEB_SEARCH_LIMIT_ERROR = "外部网页搜索次数已达到上限。请基于已获得的搜索结果回答。"
+DEFAULT_MAX_TOOL_ROUNDS = 30
+TOOL_ROUND_LIMIT_MOCK_USER = "已达工具调用轮次上限，请基于现有信息直接作答"
 
 
 @dataclass(frozen=True)
@@ -82,12 +84,14 @@ class ChatSession:
         self.messages.append(HumanMessage(content=user_text))
 
         web_search_count = 0
-        while True:
+        for _ in range(_max_tool_rounds()):
             web_search_limit_reached = False
+            self.messages = compact_history_if_needed(self.messages, model=self.model)[0]
             ai_message = self.model.invoke(self.messages)
             self.messages.append(ai_message)
             tool_calls = _message_tool_calls(ai_message)
             if not tool_calls:
+                self._prune_checkpoints()
                 return str(ai_message.content)
 
             for tool_call in tool_calls:
@@ -112,6 +116,24 @@ class ChatSession:
                 )
             if web_search_limit_reached:
                 self.messages.append(HumanMessage(content=WEB_SEARCH_LIMIT_MOCK_USER))
+
+        self.messages.append(HumanMessage(content=TOOL_ROUND_LIMIT_MOCK_USER))
+        self.messages = compact_history_if_needed(self.messages, model=self.model)[0]
+        final_message = self.model.invoke(self.messages)
+        self.messages.append(final_message)
+        self._prune_checkpoints()
+        return str(final_message.content)
+
+    def _prune_checkpoints(self) -> None:
+        """Trim this thread's checkpoint history once the turn is finished."""
+
+        prune = getattr(self.agent, "prune_thread", None)
+        if prune is None:
+            return
+        try:
+            prune(self.thread_id)
+        except Exception:
+            pass
 
     def _run_tool_call(self, raw_tool_call: dict) -> dict:
         if raw_tool_call["name"] == "delegate_agent":
@@ -189,7 +211,12 @@ class ChatSession:
 def build_openai_model() -> ChatOpenAI:
     patch_langchain_debug()
     settings = model_settings_from_env()
-    kwargs: dict[str, Any] = {"model": settings.model}
+    kwargs: dict[str, Any] = {
+        "model": settings.model,
+        "timeout": 120,
+        "max_retries": 2,
+        "stream_usage": True,
+    }
     if settings.base_url:
         kwargs["base_url"] = settings.base_url
     if settings.api_key:
@@ -199,6 +226,15 @@ def build_openai_model() -> ChatOpenAI:
     if settings.extra_body:
         kwargs["extra_body"] = settings.extra_body
     return ChatOpenAI(**kwargs)
+
+
+def _max_tool_rounds() -> int:
+    raw = os.getenv("LANGCODE_MAX_TOOL_ROUNDS", str(DEFAULT_MAX_TOOL_ROUNDS))
+    try:
+        value = int(raw)
+    except (TypeError, ValueError):
+        value = DEFAULT_MAX_TOOL_ROUNDS
+    return max(1, value)
 
 
 def _web_search_limit() -> int:
@@ -352,7 +388,11 @@ def tool_schemas(*, include_delegation: bool = True) -> list[dict]:
             "读取工作区内的 UTF-8 文本文件。",
             {
                 "type": "object",
-                "properties": {"path": {"type": "string"}},
+                "properties": {
+                    "path": {"type": "string"},
+                    "offset": {"type": "integer", "default": 0, "minimum": 0},
+                    "limit": {"type": "integer", "default": 2000, "minimum": 1, "maximum": 5000},
+                },
                 "required": ["path"],
             },
         ),
@@ -492,7 +532,7 @@ def tool_schemas(*, include_delegation: bool = True) -> list[dict]:
         ),
         _function_schema(
             "self_evolve",
-            "运行可审计的自进化流程：查看状态、反思当前会话、归档经验、生成技能/提示词/工具描述改进提案。高置信偏好可写入记忆，低置信内容只生成候选。",
+            "可审计的自进化：查看状态、反思会话、归档经验、生成改进提案。高置信偏好写入记忆，其余只生成候选。",
             {
                 "type": "object",
                 "properties": {
@@ -563,7 +603,7 @@ def tool_schemas(*, include_delegation: bool = True) -> list[dict]:
         ),
         _function_schema(
             "skill",
-            "管理可复用技能记忆。用于列出、读取、创建或更新技能文件；复杂任务完成后，如果形成了稳定流程或踩坑经验，应沉淀为技能，后续相似任务可先读取技能。",
+            "管理可复用技能记忆：列出、读取、创建或更新技能文件。形成稳定流程或踩坑经验时沉淀为技能，相似任务先读取。",
             {
                 "type": "object",
                 "properties": {
@@ -587,7 +627,7 @@ def tool_schemas(*, include_delegation: bool = True) -> list[dict]:
         ),
         _function_schema(
             "diagram",
-            "生成可在前端渲染的 Mermaid 图。任何流程、关系、架构、调用链、状态转换、数据流、审批流或协作逻辑需要清晰展示时使用；结构化节点边会通过 LangChain Graph.draw_mermaid 生成。",
+            "生成可在前端渲染的 Mermaid 图。展示流程、架构、调用链、状态转换或协作逻辑时使用；传 nodes/edges 自动生成结构化图。",
             {
                 "type": "object",
                 "properties": {
@@ -650,7 +690,7 @@ def tool_schemas(*, include_delegation: bool = True) -> list[dict]:
         ),
         _function_schema(
             "edit_file",
-            "替换工作区内 UTF-8 文件中的文本；需要人工审批。",
+            "替换工作区内 UTF-8 文件中的文本；需要人工审批。old 使用原始文件文本，不含 read_file 显示的行号前缀。",
             {
                 "type": "object",
                 "properties": {
@@ -788,6 +828,8 @@ def default_system_prompt(workspace_root: str) -> str:
         "本地命令：/compact 用于压缩较早的对话上下文，/memory 用于查看项目记忆，"
         "/agents 用于列出内置子 Agent，/skills 查看技能，/evolve 查看自进化状态，/cron 查看定时任务，以 # 开头的行会保存项目记忆。"
         "向用户说明进展时保持简洁，并严格遵守人工审批结果。"
+        "代码块必须标注语言；引用工作区文件时使用 path:line；"
+        "流程、关系和架构图使用 diagram 工具，不要用 ASCII 字符拼图。"
         "如果需要输出 Markdown 表格，必须使用合法 GFM 表格：表头、分隔行和每一行都必须各占一行；"
         "分隔行列数必须与表头一致；每个数据行列数也必须与表头一致；不要把多行表格压缩到同一行。"
     )

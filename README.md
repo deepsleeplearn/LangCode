@@ -23,10 +23,12 @@ clone 仓库后，在项目根目录执行：
 脚本会自动完成：
 
 - 检查 Python 3.11+ 和 npm。
-- 创建 `.venv` 并安装当前 Python 包。
+- 创建 `.venv`，按 `constraints.txt` 安装依赖；依赖文件没变就跳过（见 [跳过重复安装](#跳过重复安装)）。
 - 如果没有 `.env.local`，从 `.env.example` 复制一份本地配置模板。
-- 安装前端依赖并构建 `frontend/dist`。
+- 安装前端依赖；`frontend/dist` 比源码新就跳过 `npm run build`。
 - 启动 Sanic Web server，默认地址为 `http://127.0.0.1:8765`。
+
+不需要语音时用 `LANGCODE_VOICE=0 ./scripts/start_macos.sh`，只装 core（约 164MB，冷装 1 分钟），server 以 `--no-voice` 启动。
 
 首次启动前，请把 `.env.local` 里的模型或搜索 API key 替换为真实值；没有 key 时页面可以打开，但 chat 请求会返回配置错误。常用覆盖参数：
 
@@ -47,10 +49,18 @@ python3 scripts/check_release.py
 
 ## 安装
 
-在本目录执行：
+依赖分成 **core** 和 **voice** 两层。core 是 agent、CLI、Web server 在模块顶层真正 import 的那些包；所有语音模型（torch、transformers、mlx、mlx-audio、librosa、scipy、onnxruntime、silero-vad、qwen-asr、kaldi-native-fbank）都是函数内部的惰性 import，因此不装 voice 也能正常启动 Web server，只是语音功能关闭。
 
 ```bash
-python3 -m pip install -e .
+# 只装 core：约 77 个包 / 164MB，冷装约 1 分钟
+python3 -m pip install -e . -c constraints.txt
+
+# core + 语音（Apple silicon）
+python3 -m pip install -e ".[voice]" -c constraints.txt
+python3 -m pip install --no-deps -c constraints.txt -r requirements-voice-nodeps.txt
+
+# 开发（pytest）
+python3 -m pip install -e ".[dev]" -c constraints.txt
 ```
 
 如果不安装，直接从源码树运行：
@@ -58,6 +68,98 @@ python3 -m pip install -e .
 ```bash
 PYTHONPATH=src python3 -m langcode_agent.interfaces.cli --workspace .
 ```
+
+### constraints.txt：为什么必须带 `-c`
+
+`constraints.txt` 把所有存在版本冲突的包钉死到一组已知可用的版本。不带它的时候 pip 每次都要重新解析依赖：`mlx-audio` 会被从 0.5.3 一路回溯到 0.2.10（16 个版本全部下载一遍），`gradio` 再试 4 个版本，实测 5 分钟都跑不完。带上 `-c constraints.txt` 之后回溯次数为 0。
+
+只钉真正会冲突的包，其余交给 pip，这样这个文件不会因为无关的上游发版而失效。三个关键的钉子：
+
+- `numpy==2.2.6`：`librosa` 依赖的 `numba` 要求 `numpy<2.3`。core 单独装会解析到 2.5.x，之后装 voice 就得降级。
+- `huggingface_hub==0.36.2`：`transformers==4.57.6` 要求 `<1.0`。
+- `transformers==4.57.6`：`qwen-asr==0.0.6` 的硬性 pin。
+
+### 为什么 qwen-asr / mlx-audio 要用 `--no-deps`
+
+这三个包的元数据互相矛盾，pip 永远解不出来：
+
+| 包 | 声明的依赖 |
+| --- | --- |
+| `qwen-asr==0.0.6` | `transformers==4.57.6`，外加 gradio / flask / accelerate / sox / pytz / qwen-omni-utils / soynlp |
+| `mlx-audio==0.4.3` | `transformers>=5.5.0`、`huggingface_hub>=1.0` |
+| `mlx-lm==0.31.3` | `transformers>=5.0.0` |
+
+而实际能跑起来的组合就是 `transformers 4.57.6` + `mlx-audio 0.4.3`。所以我们不让 resolver 去推导，直接用 `--no-deps` 断言它（版本见 `requirements-voice-nodeps.txt`），它们真正会 import 的依赖已经写进 `[voice]` extra。
+
+### 自定义音色为什么还要装 `mlx-audio-plus`
+
+`.langcode/tts-models/Fun-CosyVoice3-0.5B-2512-8bit` 的 `config.json` 里 `model_type` 是 `cosyvoice3`，而 `mlx_audio.tts.utils` 加载模型的方式是直接 `importlib.import_module("mlx_audio.tts.models.<model_type>")`——**没有任何注册表 / entry-point 可以挂钩**，模块必须真实存在于磁盘上。
+
+问题是 PyPI 上的 `mlx-audio` **从 0.4.3 到最新的 0.5.3 全都不带 cosyvoice3**（逐个 wheel 解包验证过）。真正提供它的是 `mlx-audio-plus`（[DePasqualeOrg/mlx-audio-plus](https://github.com/DePasqualeOrg/mlx-audio-plus)，MIT），一个把文件直接装进 `mlx_audio` 命名空间的 fork，它提供：
+
+| 模块 | 谁在用 |
+| --- | --- |
+| `mlx_audio/tts/models/cosyvoice3` | 模型本体 |
+| `mlx_audio/tts/models/cosyvoice2` | 同上系列 |
+| `mlx_audio/codec/models/s3gen` | `voice/mlx_cosyvoice3.py` 直接 import |
+| `mlx_audio/codec/models/s3tokenizer` | `voice/mlx_cosyvoice3.py` 直接 import |
+
+少了它，服务器只会打印 `Model type cosyvoice3 not supported for tts.`，汪菊 / 雪芬两个音色完全不可用。
+
+两个坑：
+
+- **安装顺序**。它会覆盖 `mlx-audio 0.4.3` 名下的 250 个文件，所以必须装在 `mlx-audio` **之后**。pip 不保证 requirements 文件内部的安装顺序，因此它没有写进 `requirements-voice-nodeps.txt`，而是由 `scripts/start_macos.sh` 单独一条 `pip install` 执行。
+- **`einops`**。它只声明在 `mlx-audio-plus` 的 `tts` extra 里，被 `--no-deps` 跳过，但 cosyvoice3 的加载路径确实会走到，缺了就是 `ModuleNotFoundError: No module named 'einops'`。已经补进 `[voice]` extra。
+
+它自己声明的是 `transformers<5.0.0,>=4.49.0`，和我们钉的 4.57.6 兼容；仍然用 `--no-deps` 是因为它还声明了 `mlx-lm<0.30.0`（我们跑 0.31.3，实测没问题）和一整条 `mlx-audio[all]` 尾巴。
+
+每次 `LANGCODE_VOICE=1` 启动时，`scripts/start_macos.sh` 都会跑一次
+`python scripts/prepare_mlx_cosyvoice3.py --check-overlay --repair-overlay`
+做幂等校验：只 stat 几个路径，不 import 任何重包；发现 overlay 被别的 pip 命令覆盖掉了就自动重装。
+
+顺带省掉 qwen-asr 那条只服务 demo 的尾巴（约 250MB）：`gradio` 只在 `qwen_asr/cli/demo.py` 里 import，`flask` 只在 `cli/demo_streaming.py`，`soynlp` 只在 forced aligner 的韩文分支里惰性 import——这些代码路径我们一行都不会走。但 `nagisa` 是 `qwen_asr/__init__.py` 的顶层 import，必须装；它依赖的 `dyNET38==2.2` **只有 cp312 / macOS arm64 的 wheel**，所以语音这一层目前锁定 Python 3.12。
+
+### 关闭语音：`LANGCODE_VOICE=0`
+
+```bash
+LANGCODE_VOICE=0 ./scripts/start_macos.sh
+```
+
+此时启动脚本只装 core，并给 server 传 `--no-voice`，不加载任何本地 ASR/TTS 模型。也可以直接用命令行开关：
+
+```bash
+PYTHONPATH=src python3 -m langcode_agent.interfaces.web --workspace . --no-voice
+```
+
+`--no-voice` 和 `LANGCODE_VOICE=0` 等价（显式的命令行参数优先）。设置了 `LANGCODE_VOICE_WORKER_URL` 时，远端 voice worker 仍然可用。
+
+### 跳过重复安装
+
+`scripts/start_macos.sh` 会把 `pyproject.toml` + `constraints.txt` + `requirements-voice-nodeps.txt` + 当前 `LANGCODE_VOICE` 取值的 sha256 写到 `.venv/.langcode-install-stamp`。stamp 没变就跳过 `pip install`（并打印跳过原因）。stamp 只在整个安装成功之后才写入，所以中途 Ctrl-C 下次会重试。需要强制重装：
+
+```bash
+LANGCODE_FORCE_INSTALL=1 ./scripts/start_macos.sh
+```
+
+前端同理：只有当 `frontend/src`、`frontend/index.html`、`frontend/package.json`、`frontend/vite.config.js` 里有文件比 `frontend/dist/index.html` 新时才跑 `npm run build`。
+
+### 升级版本后怎么刷新 constraints.txt
+
+```bash
+python3 -m venv /tmp/lc-pin
+/tmp/lc-pin/bin/pip install -e ".[voice]"          # 先不带 -c，让 pip 自由解析
+/tmp/lc-pin/bin/pip install --no-deps -r requirements-voice-nodeps.txt
+/tmp/lc-pin/bin/pip freeze                          # 把相关行抄回 constraints.txt
+rm -rf /tmp/lc-pin
+```
+
+改完用这条确认没有回溯（必须输出 `0`）：
+
+```bash
+pip install --dry-run -e ".[voice]" -c constraints.txt 2>&1 | grep -c "looking at multiple versions"
+```
+
+注意不要在项目自己的 `.venv` 里做这件事，否则 stamp 和实际内容会对不上。
 
 ## 模型配置
 

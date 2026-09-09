@@ -1,0 +1,21 @@
+# Installed with `pip install --no-deps -c constraints.txt -r <this file>`.
+#
+# Both packages declare requirements that cannot be satisfied together:
+#   qwen-asr==0.0.6   -> transformers==4.57.6 (+ gradio/flask/accelerate/... demo tail)
+#   mlx-audio==0.4.3  -> transformers>=5.5.0, huggingface_hub>=1.0
+#   mlx-lm==0.31.3    -> transformers>=5.0.0
+#
+# transformers 4.57.6 + mlx-audio 0.4.3 is the combination that actually works at
+# runtime, so we assert it instead of letting pip backtrack looking for one.
+# Their real runtime imports are listed in the `voice` extra of pyproject.toml.
+qwen-asr==0.0.6
+mlx-audio==0.4.3
+mlx-lm==0.31.3
+
+# NOTE: mlx-audio-plus (pinned in constraints.txt) is deliberately NOT listed
+# here. It overlays the same `mlx_audio` package - it overwrites 250 of the
+# files mlx-audio 0.4.3 owns while adding the cosyvoice3 / s3gen / s3tokenizer
+# modules our TTS needs. pip does not guarantee the install order of entries in
+# a requirements file, and losing the race silently disables custom-voice TTS,
+# so start_macos.sh installs it in a separate pip step immediately after this
+# one. See the mlx-audio-plus block in constraints.txt.

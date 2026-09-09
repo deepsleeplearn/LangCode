@@ -1,10 +1,19 @@
 from pathlib import Path
+import os
 import subprocess
+import time
 
 import pytest
 
 from langcode_agent.core.context_management import compact_tool_result, make_json_safe
-from langcode_agent.tooling.tools import edit_file, execute_tool, read_file, shell, write_file
+from langcode_agent.tooling.tools import (
+    detect_workspace_escape,
+    edit_file,
+    execute_tool,
+    read_file,
+    shell,
+    write_file,
+)
 from langcode_agent.tooling.web_tools import web_fetch
 from langcode_agent.core.paths import WorkspaceViolation
 
@@ -12,7 +21,17 @@ from langcode_agent.core.paths import WorkspaceViolation
 def test_read_and_write_file_inside_workspace(tmp_path: Path) -> None:
     write_file(tmp_path, "README.md", "hello")
 
-    assert read_file(tmp_path, "README.md") == "hello"
+    assert read_file(tmp_path, "README.md") == "1: hello\n\n[共 1 行，已显示 1-1 行]"
+
+
+def test_read_file_reports_pagination_metadata(tmp_path: Path) -> None:
+    (tmp_path / "many.txt").write_text("a\nb\nc\n", encoding="utf-8")
+
+    result = execute_tool(tmp_path, "read_file", {"path": "many.txt", "limit": 2})
+
+    assert result["total_lines"] == 3
+    assert result["shown_range"] == [1, 2]
+    assert result["truncated"] is True
 
 
 def test_write_file_rejects_workspace_escape(tmp_path: Path) -> None:
@@ -42,6 +61,12 @@ def test_shell_runs_in_workspace_with_timeout(tmp_path: Path) -> None:
 
     assert result.exit_code == 0
     assert result.stdout.strip() == str(tmp_path)
+
+
+@pytest.mark.parametrize("command", ["cat $HOME/.ssh/id_rsa", "cat ${HOME}/.ssh/id_rsa", "cat $HOME/.aws/credentials"])
+def test_shell_rejects_environment_variable_workspace_escape(tmp_path: Path, command: str) -> None:
+    with pytest.raises(WorkspaceViolation):
+        shell(tmp_path, command, timeout_seconds=5)
 
 
 def test_ls_and_glob_use_workspace_backend(tmp_path: Path) -> None:
@@ -357,6 +382,78 @@ def test_diagram_tool_rejects_unsafe_mermaid(tmp_path: Path) -> None:
     assert "不安全" in result["error"]
 
 
+def test_diagram_tool_accepts_a_structurally_valid_raw_flowchart(tmp_path: Path) -> None:
+    result = execute_tool(
+        tmp_path,
+        "diagram",
+        {
+            "title": "ok",
+            "mermaid": (
+                "flowchart TD\n"
+                "  %% 说明\n"
+                '  subgraph S1["子系统 A"]\n'
+                '    A["开始 (init)"] --> B{判断?}\n'
+                "  end\n"
+                "  B -->|是| C[结束]\n"
+                "  B -- 否 --> D((重试))\n"
+                "  C & D --> E\n"
+                "  style A fill:#f9f\n"
+            ),
+        },
+    )
+
+    assert result["ok"] is True
+    assert result["mermaid"].startswith("flowchart TD")
+
+
+def test_diagram_tool_rejects_unbalanced_brackets(tmp_path: Path) -> None:
+    result = execute_tool(
+        tmp_path,
+        "diagram",
+        {"title": "bad", "mermaid": "flowchart TD\n  A[Start --> B\n"},
+    )
+
+    assert result["ok"] is False
+    assert "不平衡" in result["error"]
+    assert result["hint"]
+
+
+def test_diagram_tool_rejects_a_dangling_edge_endpoint(tmp_path: Path) -> None:
+    result = execute_tool(tmp_path, "diagram", {"title": "bad", "mermaid": "flowchart TD\n  A --> \n"})
+
+    assert result["ok"] is False
+    assert "端点" in result["error"]
+    assert result["hint"]
+
+
+def test_diagram_tool_rejects_conflicting_duplicate_node_labels(tmp_path: Path) -> None:
+    result = execute_tool(
+        tmp_path,
+        "diagram",
+        {"title": "bad", "mermaid": "flowchart TD\n  A[开始] --> B[结束]\n  A[启动] --> C\n"},
+    )
+
+    assert result["ok"] is False
+    assert "冲突" in result["error"]
+    assert result["hint"]
+
+
+def test_diagram_tool_rejects_edges_referencing_undeclared_nodes(tmp_path: Path) -> None:
+    result = execute_tool(
+        tmp_path,
+        "diagram",
+        {
+            "title": "bad",
+            "nodes": [{"id": "a", "label": "A"}],
+            "edges": [{"source": "a", "target": "ghost"}],
+        },
+    )
+
+    assert result["ok"] is False
+    assert "ghost" in result["error"]
+    assert result["hint"]
+
+
 def test_sandbox_shell_does_not_mutate_real_workspace(tmp_path: Path) -> None:
     result = execute_tool(
         tmp_path,
@@ -367,6 +464,68 @@ def test_sandbox_shell_does_not_mutate_real_workspace(tmp_path: Path) -> None:
     assert result["ok"] is True
     assert result["result"]["exit_code"] == 0
     assert not (tmp_path / "only-sandbox.txt").exists()
+
+
+def test_gc_sandboxes_only_removes_stale_prefixed_dirs(tmp_path: Path, monkeypatch) -> None:
+    from langcode_agent.runtime import sandbox as sandbox_module
+
+    monkeypatch.setattr(sandbox_module.tempfile, "gettempdir", lambda: str(tmp_path))
+    old = time.time() - 7 * 60 * 60
+    stale = tmp_path / f"{sandbox_module.SANDBOX_DIR_PREFIX}stale"
+    fresh = tmp_path / f"{sandbox_module.SANDBOX_DIR_PREFIX}fresh"
+    unrelated = tmp_path / "someone-elses-tmpdir"
+    stale_file = tmp_path / f"{sandbox_module.SANDBOX_DIR_PREFIX}not-a-dir"
+    for directory in (stale, fresh, unrelated):
+        directory.mkdir()
+    stale_file.write_text("x", encoding="utf-8")
+    for path in (stale, unrelated, stale_file):
+        os.utime(path, (old, old))
+
+    removed = sandbox_module.gc_sandboxes()
+
+    assert removed == 1
+    assert not stale.exists()
+    assert fresh.is_dir()
+    assert unrelated.is_dir()
+    assert stale_file.exists()
+
+
+def test_gc_sandboxes_never_removes_a_sandbox_in_use(tmp_path: Path, monkeypatch) -> None:
+    from langcode_agent.runtime import sandbox as sandbox_module
+
+    monkeypatch.setattr(sandbox_module.tempfile, "gettempdir", lambda: str(tmp_path))
+    old = time.time() - 7 * 60 * 60
+    in_use = tmp_path / f"{sandbox_module.SANDBOX_DIR_PREFIX}running"
+    in_use.mkdir()
+    os.utime(in_use, (old, old))
+
+    monkeypatch.setattr(sandbox_module, "_ACTIVE_SANDBOXES", {str(in_use.resolve())})
+
+    assert sandbox_module.gc_sandboxes() == 0
+    assert in_use.is_dir()
+
+
+def test_sandbox_shell_registers_and_releases_its_own_sandbox(tmp_path: Path) -> None:
+    from langcode_agent.runtime import sandbox as sandbox_module
+
+    seen: list[set[str]] = []
+
+    original = sandbox_module.shell
+
+    def spy(work_dir, command, **kwargs):
+        seen.append(set(sandbox_module._ACTIVE_SANDBOXES))
+        return original(work_dir, command, **kwargs)
+
+    sandbox_module.shell = spy
+    try:
+        execute_tool(tmp_path, "sandbox_shell", {"command": "printf ok", "copy_workspace": False})
+    finally:
+        sandbox_module.shell = original
+
+    assert len(seen) == 1
+    assert len(seen[0]) == 1
+    # ...and the registration is dropped once the sandbox is torn down.
+    assert sandbox_module._ACTIVE_SANDBOXES == set()
 
 
 def test_sandbox_shell_rejects_inline_interpreter_escape(tmp_path: Path) -> None:
@@ -427,6 +586,12 @@ def test_shell_rejects_absolute_path_outside_workspace(tmp_path: Path) -> None:
         shell(tmp_path, f"printf escaped > {outside}", timeout_seconds=5)
 
 
+@pytest.mark.parametrize("command", ["cat ../../../etc/passwd", "cd .. && ls"])
+def test_shell_rejects_relative_workspace_escape(tmp_path: Path, command: str) -> None:
+    with pytest.raises(WorkspaceViolation):
+        shell(tmp_path, command, timeout_seconds=5)
+
+
 def test_shell_allows_absolute_path_outside_workspace_when_explicitly_enabled(tmp_path: Path) -> None:
     outside = tmp_path.parent / "outside.txt"
 
@@ -446,6 +611,31 @@ def test_shell_rejects_nested_shell_absolute_path_outside_workspace(tmp_path: Pa
 
     with pytest.raises(WorkspaceViolation):
         shell(tmp_path, f"sh -c 'printf escaped > {outside}'", timeout_seconds=5)
+
+
+@pytest.mark.parametrize(
+    "command",
+    [
+        "cd ..; cat .env",
+        "ls; cat ../../.env",
+        "cat a.txt 2>../../out.txt",
+        'eval "cat ../secret.env"',
+    ],
+)
+def test_shell_rejects_escapes_hidden_behind_control_operators(tmp_path: Path, command: str) -> None:
+    # `shlex.split` glued `..;` into one token, so `cd ..; cat .env` slipped
+    # through while `cd .. && cat .env` was caught.
+    with pytest.raises(WorkspaceViolation):
+        shell(tmp_path, command, timeout_seconds=5)
+
+
+def test_shell_still_allows_chained_in_workspace_commands(tmp_path: Path) -> None:
+    (tmp_path / "sub").mkdir()
+
+    result = shell(tmp_path, "cd sub; pwd && echo done", timeout_seconds=5)
+
+    assert result.exit_code == 0
+    assert "done" in result.stdout
 
 
 def test_shell_rejects_redirect_to_symlink_escape(tmp_path: Path) -> None:
@@ -534,3 +724,66 @@ def test_web_fetch_rejects_local_urls(monkeypatch) -> None:
 
     with pytest.raises(ValueError, match="localhost"):
         web_fetch("http://localhost:8000")
+
+
+def test_global_skill_write_is_reported_as_a_workspace_escape(tmp_path: Path) -> None:
+    escape = detect_workspace_escape(
+        tmp_path,
+        "skill",
+        {"action": "upsert", "scope": "global", "name": "deploy", "description": "d", "content": "c"},
+    )
+
+    assert escape is not None
+    assert escape["dangerous"] is True
+    assert "escapes workspace" in escape["reason"]
+
+
+def test_global_skill_delete_is_reported_as_a_workspace_escape(tmp_path: Path) -> None:
+    escape = detect_workspace_escape(tmp_path, "skill", {"action": "delete", "scope": "global", "name": "deploy"})
+
+    assert escape is not None
+    assert "escapes workspace" in escape["reason"]
+
+
+def test_project_scoped_memory_writes_are_not_escapes(tmp_path: Path) -> None:
+    assert detect_workspace_escape(tmp_path, "skill", {"action": "upsert", "scope": "project", "name": "deploy"}) is None
+    assert detect_workspace_escape(tmp_path, "skill", {"action": "list"}) is None
+    assert detect_workspace_escape(tmp_path, "skill", {"action": "read", "scope": "global", "name": "deploy"}) is None
+    assert detect_workspace_escape(tmp_path, "soul", {"action": "write", "content": "x"}) is None
+    assert detect_workspace_escape(tmp_path, "memory", {"action": "add", "target": "user", "content": "x"}) is None
+
+
+def test_global_skill_write_relocated_into_workspace_is_not_an_escape(tmp_path: Path, monkeypatch) -> None:
+    monkeypatch.setenv("LANGCODE_GLOBAL_SKILLS_DIR", str(tmp_path / "shared-skills"))
+
+    assert detect_workspace_escape(tmp_path, "skill", {"action": "upsert", "scope": "global", "name": "deploy"}) is None
+
+
+def test_memory_auto_apply_can_be_disabled_by_env(tmp_path: Path, monkeypatch) -> None:
+    monkeypatch.setenv("LANGCODE_MEMORY_AUTO_APPLY", "0")
+    payload = {
+        "action": "reflect_session",
+        "session_id": "s-auto-off",
+        "messages": [
+            {"role": "human", "content": "以后请记住：默认用中文回答"},
+            {"role": "ai", "content": "好的。"},
+        ],
+        "apply": True,
+    }
+
+    result = execute_tool(tmp_path, "self_evolve", dict(payload))
+
+    assert result["ok"] is True
+    assert result["applied"] == []
+    assert any(item["kind"] == "memory" for item in result["staged"])
+
+    monkeypatch.setenv("LANGCODE_MEMORY_AUTO_APPLY", "1")
+    enabled = execute_tool(tmp_path, "self_evolve", dict(payload))
+
+    assert any(item["kind"] == "memory" for item in enabled["applied"])
+
+
+def test_memory_auto_apply_threshold_defaults_to_090(tmp_path: Path) -> None:
+    from langcode_agent.memory.evolution import _memory_auto_apply_threshold
+
+    assert _memory_auto_apply_threshold() == 0.9

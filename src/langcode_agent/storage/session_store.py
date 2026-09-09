@@ -8,12 +8,30 @@ import threading
 from typing import Iterable
 
 
+_SCHEMA_LOCK = threading.Lock()
+_SCHEMA_READY: set[str] = set()
+
+# ``load_revision`` sentinel: the row exists but was soft-deleted. ``None`` keeps
+# its original meaning of "no such session row at all", so a caller can tell a
+# never-created session apart from a deleted one instead of silently keeping a
+# stale in-memory copy alive (item 4).
+DELETED_REVISION = -1
+
+
 class SessionStore:
     def __init__(self, path: str | Path) -> None:
         self.path = Path(path).expanduser().resolve()
         self.path.parent.mkdir(parents=True, exist_ok=True)
         self._lock = threading.RLock()
-        self._initialize()
+        # sqlite3 connections are not thread-safe, so every thread that touches
+        # the store (request threads, the partial-save thread, queue workers)
+        # keeps its own connection instead of opening a fresh one per method.
+        self._local = threading.local()
+        key = str(self.path)
+        with _SCHEMA_LOCK:
+            if key not in _SCHEMA_READY or not self.path.exists():
+                self._initialize()
+                _SCHEMA_READY.add(key)
 
     def list_sessions(self) -> list[dict]:
         with self._lock, self._connect() as conn:
@@ -31,7 +49,7 @@ class SessionStore:
         with self._lock, self._connect() as conn:
             session = conn.execute(
                 """
-                SELECT id, COALESCE(NULLIF(title, ''), id) AS title, workspace, pending_json, state_json
+                SELECT id, COALESCE(NULLIF(title, ''), id) AS title, workspace, pending_json, state_json, revision
                 FROM sessions
                 WHERE id = ? AND deleted_at IS NULL
                 """,
@@ -62,8 +80,30 @@ class SessionStore:
             "workspace": session["workspace"],
             "pending": _read_json_text(session["pending_json"]),
             "state": _read_json_text(session["state_json"]) or {},
+            "revision": int(session["revision"] or 0),
             "messages": message_rows,
         }
+
+    def load_revision(self, session_id: str) -> int | None:
+        """Current revision, ``DELETED_REVISION`` when soft-deleted, ``None`` when absent."""
+        with self._lock, self._connect() as conn:
+            row = conn.execute(
+                "SELECT revision, deleted_at FROM sessions WHERE id = ?",
+                (session_id,),
+            ).fetchone()
+        if row is None:
+            return None
+        if row["deleted_at"] is not None:
+            return DELETED_REVISION
+        return int(row["revision"] or 0)
+
+    def load_title(self, session_id: str) -> str | None:
+        with self._lock, self._connect() as conn:
+            row = conn.execute(
+                "SELECT COALESCE(NULLIF(title, ''), id) AS title FROM sessions WHERE id = ? AND deleted_at IS NULL",
+                (session_id,),
+            ).fetchone()
+        return str(row["title"]) if row is not None else None
 
     def search_messages(self, query: str, *, current_session_id: str = "", limit: int = 8) -> list[dict]:
         term = str(query or "").strip()
@@ -269,6 +309,12 @@ class SessionStore:
                     now,
                 ),
             )
+            # Item 7: an agent dialogue is session state too, so it has to bump the
+            # revision - otherwise another worker keeps serving a stale cache.
+            conn.execute(
+                "UPDATE sessions SET updated_at = ?, revision = revision + 1 WHERE id = ? AND deleted_at IS NULL",
+                (now, session_id),
+            )
             conn.commit()
 
     def ensure_session(self, session_id: str, workspace: str, *, title: str | None = None) -> None:
@@ -286,6 +332,9 @@ class SessionStore:
                 ON CONFLICT(id) DO UPDATE SET
                     workspace = excluded.workspace,
                     updated_at = sessions.updated_at,
+                    revision = sessions.revision + CASE
+                        WHEN sessions.workspace IS NOT excluded.workspace
+                             OR sessions.deleted_at IS NOT NULL THEN 1 ELSE 0 END,
                     deleted_at = NULL
                 """,
                 (session_id, title or session_id, workspace, now, now),
@@ -311,22 +360,32 @@ class SessionStore:
         title: str | None = None,
         pending: dict | None = None,
         state: dict | None = None,
+        restore: bool = False,
     ) -> None:
+        """Persist a session's full history.
+
+        ``restore=False`` (the default) never clears ``deleted_at``: a late save
+        from a request that still holds a stale in-memory session must not bring
+        a deleted session back from the dead (item 4). Pass ``restore=True`` only
+        where undeleting is the explicit intent.
+        """
         now = _utc_now()
         pending_json = json.dumps(pending, ensure_ascii=False) if pending else None
         state_json = json.dumps(state, ensure_ascii=False) if state else None
+        deleted_clause = "deleted_at = NULL," if restore else ""
         with self._lock, self._connect() as conn:
             conn.execute("BEGIN IMMEDIATE")
             conn.execute(
-                """
-                INSERT INTO sessions (id, title, workspace, created_at, updated_at, deleted_at, pending_json, state_json)
-                VALUES (?, ?, ?, ?, ?, NULL, ?, ?)
+                f"""
+                INSERT INTO sessions (id, title, workspace, created_at, updated_at, deleted_at, pending_json, state_json, revision)
+                VALUES (?, ?, ?, ?, ?, NULL, ?, ?, 1)
                 ON CONFLICT(id) DO UPDATE SET
                     workspace = excluded.workspace,
                     updated_at = excluded.updated_at,
-                    deleted_at = NULL,
+                    {deleted_clause}
                     pending_json = excluded.pending_json,
-                    state_json = excluded.state_json
+                    state_json = excluded.state_json,
+                    revision = sessions.revision + 1
                 """,
                 (session_id, title or session_id, workspace, now, now, pending_json, state_json),
             )
@@ -372,12 +431,44 @@ class SessionStore:
             )
             conn.commit()
 
+    def upsert_partial(self, session_id: str, idx: int, role: str, content: str) -> None:
+        """Persist one in-progress message without rebuilding the session index."""
+        now = _utc_now()
+        with self._lock, self._connect() as conn:
+            conn.execute("BEGIN IMMEDIATE")
+            # Item 8: a partial save that lands after the session was deleted must
+            # not write orphan message rows the delete will never clean up.
+            alive = conn.execute(
+                "SELECT 1 FROM sessions WHERE id = ? AND deleted_at IS NULL",
+                (session_id,),
+            ).fetchone()
+            if alive is None:
+                conn.rollback()
+                return
+            conn.execute(
+                """
+                INSERT INTO messages (session_id, idx, role, content, tool_call_id, tool_calls_json)
+                VALUES (?, ?, ?, ?, NULL, NULL)
+                ON CONFLICT(session_id, idx) DO UPDATE SET
+                    role = excluded.role,
+                    content = excluded.content,
+                    tool_call_id = NULL,
+                    tool_calls_json = NULL
+                """,
+                (session_id, int(idx), role, content),
+            )
+            conn.execute(
+                "UPDATE sessions SET updated_at = ?, revision = revision + 1 WHERE id = ? AND deleted_at IS NULL",
+                (now, session_id),
+            )
+            conn.commit()
+
     def rename_session(self, session_id: str, title: str) -> None:
         now = _utc_now()
         with self._lock, self._connect() as conn:
             conn.execute("BEGIN IMMEDIATE")
             conn.execute(
-                "UPDATE sessions SET title = ?, updated_at = ? WHERE id = ? AND deleted_at IS NULL",
+                "UPDATE sessions SET title = ?, updated_at = ?, revision = revision + 1 WHERE id = ? AND deleted_at IS NULL",
                 (title, now, session_id),
             )
             conn.execute(
@@ -391,7 +482,7 @@ class SessionStore:
         with self._lock, self._connect() as conn:
             conn.execute("BEGIN IMMEDIATE")
             conn.execute(
-                "UPDATE sessions SET deleted_at = ?, updated_at = ? WHERE id = ?",
+                "UPDATE sessions SET deleted_at = ?, updated_at = ?, revision = revision + 1 WHERE id = ?",
                 (now, now, session_id),
             )
             conn.execute("DELETE FROM messages WHERE session_id = ?", (session_id,))
@@ -408,7 +499,7 @@ class SessionStore:
         with self._lock, self._connect() as conn:
             conn.execute("BEGIN IMMEDIATE")
             updated = conn.execute(
-                "UPDATE sessions SET updated_at = ?, pending_json = NULL, state_json = NULL WHERE id = ? AND deleted_at IS NULL",
+                "UPDATE sessions SET updated_at = ?, pending_json = NULL, state_json = NULL, revision = revision + 1 WHERE id = ? AND deleted_at IS NULL",
                 (now, session_id),
             )
             if updated.rowcount == 0:
@@ -459,7 +550,8 @@ class SessionStore:
                     deleted_at TEXT,
                     pending_json TEXT
                     ,
-                    state_json TEXT
+                    state_json TEXT,
+                    revision INTEGER NOT NULL DEFAULT 0
                 );
 
                 CREATE TABLE IF NOT EXISTS messages (
@@ -538,6 +630,8 @@ class SessionStore:
                 conn.execute("ALTER TABLE sessions ADD COLUMN pending_json TEXT")
             if "state_json" not in columns:
                 conn.execute("ALTER TABLE sessions ADD COLUMN state_json TEXT")
+            if "revision" not in columns:
+                conn.execute("ALTER TABLE sessions ADD COLUMN revision INTEGER NOT NULL DEFAULT 0")
             message_columns = {
                 row["name"]
                 for row in conn.execute("PRAGMA table_info(messages)").fetchall()
@@ -546,12 +640,35 @@ class SessionStore:
                 conn.execute("ALTER TABLE messages ADD COLUMN tool_calls_json TEXT")
 
     def _connect(self) -> sqlite3.Connection:
+        conn = getattr(self._local, "conn", None)
+        if conn is not None:
+            try:
+                conn.execute("SELECT 1")
+                return conn
+            except sqlite3.Error:
+                try:
+                    conn.close()
+                except sqlite3.Error:
+                    pass
+                self._local.conn = None
         conn = sqlite3.connect(self.path, timeout=30, check_same_thread=False)
         conn.row_factory = sqlite3.Row
         conn.execute("PRAGMA journal_mode=WAL")
         conn.execute("PRAGMA busy_timeout=30000")
         conn.execute("PRAGMA foreign_keys=ON")
+        self._local.conn = conn
         return conn
+
+    def close_thread_connection(self) -> None:
+        """Close this thread's cached connection (used by long-lived worker threads)."""
+        conn = getattr(self._local, "conn", None)
+        if conn is None:
+            return
+        self._local.conn = None
+        try:
+            conn.close()
+        except sqlite3.Error:
+            pass
 
 
 def _utc_now() -> str:

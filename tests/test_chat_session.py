@@ -1,10 +1,29 @@
 from pathlib import Path
+import time
 
-from langchain_core.messages import AIMessage, ToolMessage
+from langchain_core.messages import AIMessage, HumanMessage, SystemMessage, ToolMessage
+
+from langcode_agent.core.context_management import (
+    CONTEXT_SUMMARY_ACK,
+    CONTEXT_SUMMARY_PREFIX,
+    compact_history_if_needed,
+    count_messages_tokens,
+)
 
 from langcode_agent.runtime.agent import CodeAgent
-from langcode_agent.runtime.chat import ChatSession, default_system_prompt, messages_from_json, model_settings_from_env, tool_schemas
-from langcode_agent.runtime.delegation import _delegate_system_prompt, run_delegate_agent
+from langcode_agent.runtime.chat import (
+    TOOL_ROUND_LIMIT_MOCK_USER,
+    ChatSession,
+    default_system_prompt,
+    messages_from_json,
+    model_settings_from_env,
+    tool_schemas,
+)
+from langcode_agent.runtime.delegation import (
+    TOOL_ROUND_LIMIT_MOCK_USER as DELEGATE_ROUND_LIMIT_USER,
+    _delegate_system_prompt,
+    run_delegate_agent,
+)
 from langcode_agent.runtime.multi_agent import run_agent_debate, run_parallel_delegate_agents
 from langcode_agent.storage.session_store import SessionStore
 from langcode_agent.memory.project import compact_messages, serialize_message
@@ -498,6 +517,25 @@ def test_parallel_delegate_agents_persists_dialogue(tmp_path: Path) -> None:
     assert saved["messages"][0]["content"].startswith("researcher:查事实")
 
 
+def test_parallel_delegate_agents_isolates_one_agent_failure(tmp_path: Path) -> None:
+    def fake_runner(_workspace_root, *, role, task, context=""):
+        if task == "fail":
+            raise RuntimeError("boom")
+        return {"ok": True, "role": role, "summary": task}
+
+    result = run_parallel_delegate_agents(
+        tmp_path,
+        agents=[
+            {"id": "a", "name": "甲", "task": "pass"},
+            {"id": "b", "name": "乙", "task": "fail"},
+        ],
+        delegate_runner=fake_runner,
+    )
+
+    assert result["results"][0]["ok"] is True
+    assert result["results"][1] == {"ok": False, "error": "RuntimeError: boom"}
+
+
 def test_agent_debate_persists_and_continues_transcript(tmp_path: Path) -> None:
     store = SessionStore(tmp_path / ".langcode" / "web.sqlite")
     store.ensure_session("session-1", str(tmp_path))
@@ -536,3 +574,402 @@ def test_agent_debate_persists_and_continues_transcript(tmp_path: Path) -> None:
     saved = store.load_agent_thread("debate-1")
     assert saved is not None
     assert len(saved["messages"]) == 6
+
+
+class LoopingDelegateModel:
+    """A sub-agent model that keeps asking for tools until told to stop."""
+
+    def __init__(self) -> None:
+        self.calls = 0
+
+    def bind_tools(self, tools):
+        self.tools = tools
+        return self
+
+    def invoke(self, messages):
+        self.calls += 1
+        if any(getattr(message, "content", "") == DELEGATE_ROUND_LIMIT_USER for message in messages):
+            return AIMessage(content="基于现有信息的最终结论")
+        return AIMessage(
+            content="",
+            tool_calls=[{"name": "ls", "args": {"path": "."}, "id": f"loop-{self.calls}"}],
+        )
+
+
+def test_delegate_agent_stops_at_explicit_round_limit(tmp_path: Path) -> None:
+    model = LoopingDelegateModel()
+
+    result = run_delegate_agent(tmp_path, task="无限循环", max_rounds=3, model=model)
+
+    assert result["ok"] is True
+    assert result["round_limit_reached"] is True
+    assert result["max_rounds"] == 3
+    assert result["summary"] == "基于现有信息的最终结论"
+    assert model.calls == 4
+
+
+def test_delegate_agent_round_limit_defaults_to_env(tmp_path: Path, monkeypatch) -> None:
+    monkeypatch.setenv("LANGCODE_SUBAGENT_MAX_ROUNDS", "2")
+    model = LoopingDelegateModel()
+
+    result = run_delegate_agent(tmp_path, task="无限循环", model=model)
+
+    assert result["round_limit_reached"] is True
+    assert model.calls == 3
+
+
+def test_delegate_agent_feeds_tool_failure_back_instead_of_aborting(tmp_path: Path) -> None:
+    class FailingThenAnsweringModel:
+        def __init__(self) -> None:
+            self.calls = 0
+
+        def bind_tools(self, tools):
+            return self
+
+        def invoke(self, messages):
+            self.calls += 1
+            if self.calls == 1:
+                return AIMessage(
+                    content="",
+                    tool_calls=[{"name": "read_file", "args": {"path": "missing.txt"}, "id": "bad-1"}],
+                )
+            return AIMessage(content="工具失败后我继续作答")
+
+    model = FailingThenAnsweringModel()
+    result = run_delegate_agent(tmp_path, task="读不存在的文件", model=model)
+
+    assert result["ok"] is True
+    assert result["summary"] == "工具失败后我继续作答"
+    assert model.calls == 2
+
+
+def test_parallel_delegate_agents_forwards_max_rounds(tmp_path: Path) -> None:
+    seen: list[int | None] = []
+
+    def fake_runner(_workspace_root, *, role, task, context="", max_rounds=None):
+        seen.append(max_rounds)
+        return {"ok": True, "role": role, "summary": task}
+
+    run_parallel_delegate_agents(
+        tmp_path,
+        agents=[{"id": "a", "name": "甲", "task": "查事实"}],
+        max_rounds=5,
+        delegate_runner=fake_runner,
+    )
+
+    assert seen == [5]
+
+
+class AlwaysToolCallingModel:
+    def __init__(self) -> None:
+        self.calls = 0
+
+    def bind_tools(self, tools):
+        self.bound_tools = tools
+        return self
+
+    def invoke(self, messages):
+        self.calls += 1
+        if any(getattr(message, "content", "") == TOOL_ROUND_LIMIT_MOCK_USER for message in messages):
+            return AIMessage(content="到达上限后的最终回答")
+        return AIMessage(
+            content="",
+            tool_calls=[{"name": "ls", "args": {"path": "."}, "id": f"chat-loop-{self.calls}"}],
+        )
+
+
+def test_chat_session_stops_at_tool_round_limit(tmp_path: Path, monkeypatch) -> None:
+    monkeypatch.setenv("LANGCODE_MAX_TOOL_ROUNDS", "4")
+    model = AlwaysToolCallingModel()
+    session = ChatSession(
+        agent=CodeAgent(tmp_path),
+        model=model,
+        approval_callback=lambda _payload: {"type": "accept"},
+        thread_id="round-limit",
+    )
+
+    response = session.send("一直调用工具")
+
+    assert response == "到达上限后的最终回答"
+    assert model.calls == 5
+    assert any(
+        getattr(message, "content", "") == TOOL_ROUND_LIMIT_MOCK_USER for message in session.messages
+    )
+
+
+class FakeSummaryModel:
+    model_name = "gpt-4o-mini"
+
+    def __init__(self, summary: str = "摘要：讨论了 A 与 B，待办是 C。") -> None:
+        self.calls = 0
+        self.summary = summary
+
+    def invoke(self, messages):
+        self.calls += 1
+        return AIMessage(content=self.summary)
+
+
+def _long_history(turns: int = 12) -> list:
+    filler = "细节内容 " * 40
+    history: list = [SystemMessage(content="你是一个谨慎的代码 Agent")]
+    for index in range(turns):
+        history.append(HumanMessage(content=f"问题 {index} {filler}"))
+        history.append(
+            AIMessage(content="", tool_calls=[{"name": "ls", "args": {"path": "."}, "id": f"t{index}"}])
+        )
+        history.append(ToolMessage(content=f"结果 {index} {filler}", tool_call_id=f"t{index}"))
+        history.append(AIMessage(content=f"回答 {index} {filler}"))
+    return history
+
+
+def test_count_messages_tokens_grows_with_history() -> None:
+    history = _long_history(4)
+
+    assert count_messages_tokens(history[:5], "gpt-4o-mini") < count_messages_tokens(history, "gpt-4o-mini")
+    assert count_messages_tokens([], "gpt-4o-mini") == 0
+
+
+def test_compact_history_leaves_short_history_untouched() -> None:
+    history = _long_history(1)
+    model = FakeSummaryModel()
+
+    result, compacted = compact_history_if_needed(history, model=model, max_tokens=100000)
+
+    assert compacted is False
+    assert result == history
+    assert model.calls == 0
+
+
+def test_compact_history_summarizes_older_segment() -> None:
+    history = _long_history()
+    model = FakeSummaryModel()
+
+    result, compacted = compact_history_if_needed(
+        history, model=model, max_tokens=2000, keep_recent_tokens=600
+    )
+
+    assert compacted is True
+    assert model.calls == 1
+    assert isinstance(result[0], SystemMessage)
+    assert result[1].content.startswith(CONTEXT_SUMMARY_PREFIX)
+    assert "摘要：讨论了 A 与 B" in result[1].content
+    assert result[2].content == CONTEXT_SUMMARY_ACK
+    assert len(result) < len(history)
+    assert count_messages_tokens(result, "gpt-4o-mini") <= 2000
+
+
+def test_compact_history_keeps_tool_messages_paired() -> None:
+    history = _long_history()
+
+    result, _ = compact_history_if_needed(
+        history, model=FakeSummaryModel(), max_tokens=2000, keep_recent_tokens=600
+    )
+
+    for index, message in enumerate(result):
+        if isinstance(message, ToolMessage):
+            previous = result[index - 1]
+            assert isinstance(previous, AIMessage)
+            assert previous.tool_calls
+
+
+def test_compact_history_keeps_full_history_when_summary_raises() -> None:
+    class BrokenSummaryModel:
+        model_name = "gpt-4o-mini"
+
+        def invoke(self, _messages):
+            raise RuntimeError("summary backend down")
+
+    history = _long_history()
+
+    result, compacted = compact_history_if_needed(
+        history, model=BrokenSummaryModel(), max_tokens=2000, keep_recent_tokens=600
+    )
+
+    # A failed summary must never silently delete the older segment.
+    assert compacted is False
+    assert result == history
+
+
+def test_compact_history_keeps_full_history_when_summary_is_empty() -> None:
+    class EmptySummaryModel:
+        model_name = "gpt-4o-mini"
+
+        def __init__(self) -> None:
+            self.calls = 0
+
+        def invoke(self, _messages):
+            self.calls += 1
+            return AIMessage(content="   \n  ")
+
+    history = _long_history()
+    model = EmptySummaryModel()
+
+    result, compacted = compact_history_if_needed(
+        history, model=model, max_tokens=2000, keep_recent_tokens=600
+    )
+
+    assert model.calls == 1
+    assert compacted is False
+    assert result == history
+
+
+def test_compact_history_summarizes_with_the_unbound_model() -> None:
+    class Binding:
+        """Stands in for the RunnableBinding that ``bind_tools`` returns."""
+
+        def __init__(self, bound) -> None:
+            self.bound = bound
+
+        def invoke(self, _messages):
+            # A tool-bound model answers with a tool call, not prose.
+            return AIMessage(content="", tool_calls=[{"name": "ls", "args": {}, "id": "x"}])
+
+    inner = FakeSummaryModel()
+    inner.model_name = "gpt-4o-mini"
+
+    result, compacted = compact_history_if_needed(
+        _long_history(), model=Binding(inner), max_tokens=2000, keep_recent_tokens=600
+    )
+
+    assert compacted is True
+    assert inner.calls == 1
+    assert result[1].content.startswith(CONTEXT_SUMMARY_PREFIX)
+
+
+def test_large_inline_image_parts_are_counted_towards_the_budget() -> None:
+    blob = "A" * 400_000
+    message = HumanMessage(
+        content=[
+            {"type": "text", "text": "看这张图"},
+            {"type": "image_url", "image_url": {"url": f"data:image/png;base64,{blob}"}},
+        ]
+    )
+
+    tokens = count_messages_tokens([message], "gpt-4o-mini")
+
+    # ~len/4 for the blob; before the fix the image part cost ~0 tokens.
+    assert tokens > 90_000
+
+    history = [SystemMessage(content="系统"), HumanMessage(content="问题"), message, HumanMessage(content="继续")]
+    _, compacted = compact_history_if_needed(
+        history, model=FakeSummaryModel(), max_tokens=2000, keep_recent_tokens=600
+    )
+
+    assert compacted is True
+
+
+def test_token_counts_are_consistent_between_window_split_and_budget() -> None:
+    from langcode_agent.core.context_management import _TokenCounter, _recent_window_start
+
+    body = _long_history(6)[1:]
+    counter = _TokenCounter("gpt-4o-mini")
+    split = _recent_window_start(body, 600, counter)
+
+    assert count_messages_tokens(body[split:], "gpt-4o-mini") == counter.total(body[split:])
+    # Tool-calling AIMessages carry tool_calls tokens the old split ignored.
+    assert counter.total(body) > sum(
+        _TokenCounter("gpt-4o-mini").message_tokens(message) for message in body if not getattr(message, "tool_calls", None)
+    )
+
+
+def test_compact_history_handles_list_content_parts() -> None:
+    history = [SystemMessage(content="系统")]
+    for index in range(12):
+        history.append(HumanMessage(content=[{"type": "text", "text": "问题 " * 200}]))
+        history.append(AIMessage(content=[{"type": "text", "text": "回答 " * 200}]))
+
+    result, compacted = compact_history_if_needed(
+        history, model=FakeSummaryModel(), max_tokens=2000, keep_recent_tokens=600
+    )
+
+    assert compacted is True
+    assert count_messages_tokens(result, "gpt-4o-mini") <= 2000
+
+
+def test_compact_history_reads_budgets_from_env(monkeypatch) -> None:
+    monkeypatch.setenv("LANGCODE_CONTEXT_MAX_TOKENS", "2000")
+    monkeypatch.setenv("LANGCODE_CONTEXT_KEEP_RECENT_TOKENS", "600")
+    model = FakeSummaryModel()
+
+    _, compacted = compact_history_if_needed(_long_history(), model=model)
+
+    assert compacted is True
+    assert model.calls == 1
+
+
+def test_load_project_context_is_cached_until_a_file_changes(tmp_path: Path, monkeypatch) -> None:
+    from langcode_agent.memory import project as project_module
+
+    project_module.reset_project_context_cache()
+    (tmp_path / "CLAUDE.md").write_text("项目说明 v1", encoding="utf-8")
+    first = project_module.load_project_context(tmp_path)
+    assert "项目说明 v1" in first
+
+    reads = {"count": 0}
+    original_read_text = Path.read_text
+
+    def counting_read_text(self, *args, **kwargs):
+        reads["count"] += 1
+        return original_read_text(self, *args, **kwargs)
+
+    monkeypatch.setattr(Path, "read_text", counting_read_text)
+
+    assert project_module.load_project_context(tmp_path) == first
+    assert reads["count"] == 0
+
+    time.sleep(0.01)
+    (tmp_path / "CLAUDE.md").write_text("项目说明 v2", encoding="utf-8")
+    refreshed = project_module.load_project_context(tmp_path)
+
+    assert reads["count"] > 0
+    assert "项目说明 v2" in refreshed
+
+
+def test_skill_catalog_cache_invalidates_when_a_skill_is_added(tmp_path: Path) -> None:
+    from langcode_agent.memory import project as project_module
+
+    project_module.reset_project_context_cache()
+    skills_dir = tmp_path / ".langcode" / "skills" / "deploy"
+    skills_dir.mkdir(parents=True)
+    (skills_dir / "SKILL.md").write_text("---\nname: deploy\ndescription: 发布流程\n---\n步骤", encoding="utf-8")
+
+    assert [item["name"] for item in project_module.load_skill_catalog(tmp_path)] == ["deploy"]
+
+    other = tmp_path / ".langcode" / "skills" / "review"
+    other.mkdir(parents=True)
+    (other / "SKILL.md").write_text("---\nname: review\ndescription: 评审流程\n---\n步骤", encoding="utf-8")
+
+    assert sorted(item["name"] for item in project_module.load_skill_catalog(tmp_path)) == ["deploy", "review"]
+
+
+def test_ensure_hermes_memory_files_runs_its_syscalls_once_per_workspace(tmp_path: Path, monkeypatch) -> None:
+    from langcode_agent.memory import project as project_module
+
+    project_module.reset_project_context_cache()
+    project_module.ensure_hermes_memory_files(tmp_path)
+
+    mkdirs = {"count": 0}
+    original_mkdir = Path.mkdir
+
+    def counting_mkdir(self, *args, **kwargs):
+        mkdirs["count"] += 1
+        return original_mkdir(self, *args, **kwargs)
+
+    monkeypatch.setattr(Path, "mkdir", counting_mkdir)
+    project_module.ensure_hermes_memory_files(tmp_path)
+    project_module.ensure_hermes_memory_files(tmp_path)
+
+    assert mkdirs["count"] == 0
+
+
+def test_long_tool_descriptions_stay_compact() -> None:
+    descriptions = {
+        schema["function"]["name"]: schema["function"]["description"] for schema in tool_schemas()
+    }
+
+    assert len(descriptions["diagram"]) <= 75
+    assert len(descriptions["self_evolve"]) <= 50
+    assert len(descriptions["skill"]) <= 55
+    assert "Mermaid" in descriptions["diagram"]
+    assert "记忆" in descriptions["self_evolve"]
+    assert "技能" in descriptions["skill"]

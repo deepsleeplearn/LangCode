@@ -117,6 +117,50 @@ class JobQueue:
                         continue
                     yield json.loads(_decode(raw_event))
 
+    @property
+    def async_events_supported(self) -> bool:
+        """True when redis.asyncio is importable, so events need no thread per read."""
+        if self._redis is None:
+            return False
+        try:
+            import redis.asyncio  # noqa: F401
+        except Exception:
+            return False
+        return True
+
+    async def aiter_events(self, job_id: str, *, block_ms: int = 4000):
+        """Async variant of iter_events backed by redis.asyncio."""
+        self._require_redis()
+        import redis.asyncio as aioredis  # type: ignore
+
+        client = aioredis.Redis.from_url(
+            self.redis_url,
+            socket_connect_timeout=0.3,
+            decode_responses=True,
+        )
+        stream_key = self._events_key(job_id)
+        last_id = "0-0"
+        try:
+            while True:
+                rows = await client.xread({stream_key: last_id}, block=block_ms, count=20)
+                if not rows:
+                    yield None
+                    continue
+                for _stream, messages in rows:
+                    for message_id, fields in messages:
+                        last_id = _decode(message_id)
+                        raw_event = fields.get("event") if isinstance(fields, dict) else None
+                        if raw_event is None:
+                            continue
+                        yield json.loads(_decode(raw_event))
+        finally:
+            closer = getattr(client, "aclose", None) or getattr(client, "close", None)
+            if closer is not None:
+                try:
+                    await closer()
+                except Exception:
+                    pass
+
     def _connect(self) -> None:
         if _falsy(self.enabled):
             self._error = "disabled"

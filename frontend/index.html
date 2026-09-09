@@ -3,11 +3,24 @@
   <head>
     <meta charset="UTF-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <meta name="langcode-token" content="__LANGCODE_TOKEN__" />
     <title>LangCode</title>
+    <script>
+      // Blocking on purpose: the persisted theme has to sit on <html> before the stylesheet
+      // paints, otherwise a dark-mode user gets a white flash while the bundle loads.
+      // Key and values must stay in step with THEME_STORAGE_KEY / THEME_MODES in main.jsx.
+      (function () {
+        try {
+          var mode = localStorage.getItem('langcode-theme');
+          if (mode === 'dark' || mode === 'light') document.documentElement.dataset.theme = mode;
+        } catch (error) {
+          // Storage blocked (private mode): prefers-color-scheme in CSS still applies.
+        }
+      })();
+    </script>
   </head>
   <body>
     <div id="root"></div>
     <script type="module" src="/src/main.jsx"></script>
   </body>
 </html>
-

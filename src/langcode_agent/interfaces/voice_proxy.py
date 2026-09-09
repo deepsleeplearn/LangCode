@@ -42,6 +42,13 @@ class VoiceWorkerClient:
             result.raise_for_status()
             return result.content, result.headers.get("content-type", "audio/wav")
 
+    async def cancel_tts(self, payload: dict[str, Any]) -> dict[str, Any]:
+        """Forward a barge-in cancel; the worker owns the producer to stop."""
+        async with httpx.AsyncClient(timeout=self.timeout_seconds) as client:
+            result = await client.post(self._url("/api/tts/cancel"), json=payload)
+            result.raise_for_status()
+            return dict(result.json())
+
     async def stream_tts(self, payload: dict[str, Any]):
         async with httpx.AsyncClient(timeout=None) as client:
             async with client.stream("POST", self._url("/api/tts/stream"), json=payload) as upstream:
