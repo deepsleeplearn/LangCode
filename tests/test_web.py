@@ -17,7 +17,6 @@ def test_web_chat_without_api_key_returns_actionable_error(tmp_path: Path, monke
     monkeypatch.delenv("LANGCODE_MODEL", raising=False)
     monkeypatch.delenv("ZHIPU_API_KEY", raising=False)
     monkeypatch.delenv("OPENAI_API_KEY", raising=False)
-    monkeypatch.delenv("AIMP_GPT4O_API_KEY", raising=False)
     app = WebApp(tmp_path, tmp_path)
 
     response = app.chat({"sessionId": "no-key", "message": "hello"})
@@ -1235,13 +1234,15 @@ def test_web_settings_updates_model_and_unbinds_sessions(tmp_path: Path, monkeyp
     session = app.get_session("settings")
     session.model = object()
 
-    response = app.set_settings({"provider": "openai", "model": "gpt-4o", "gateway": "aimp", "thinking": True})
+    response = app.set_settings(
+        {"provider": "openai", "model": "qwen3.8-max", "gateway": "aimp-qwen3.8-max", "thinking": False}
+    )
 
     assert response["ok"] is True
     assert response["provider"] == "openai"
-    assert response["model"] == "gpt-4o"
-    assert response["gateway"] == "aimp"
-    assert response["thinking"] is True
+    assert response["model"] == "qwen3.8-max"
+    assert response["gateway"] == "aimp-qwen3.8-max"
+    assert response["thinking"] is False
     assert session.model is None
 
 

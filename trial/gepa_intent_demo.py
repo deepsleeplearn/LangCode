@@ -28,11 +28,11 @@ MODEL_PRESETS = {
         "default_api_base": "https://aimpapi.midea.com/t-aigc/aimp-deepseek-v4-pro/v1",
         "headers": "aigc-user",
     },
-    "gpt-4o": {
-        "api_base_env": "AIMP_GPT4O_BASE_URL",
-        "api_key_env": "AIMP_GPT4O_API_KEY",
-        "user_env": "AIMP_GPT4O_USER",
-        "default_api_base": "https://aimpapi.midea.com/t-aigc/mip-chat-app/openai/standard/v1",
+    "qwen3.8-max": {
+        "api_base_env": "AIMP_QWEN3_8_MAX_BASE_URL",
+        "api_key_env": "AIMP_QWEN3_8_MAX_API_KEY",
+        "user_env": "AIMP_QWEN3_8_MAX_USER",
+        "default_api_base": "https://aimpapi.midea.com/t-aigc/mip-chat-app/openai/v1",
         "headers": "aimp-biz-id",
     },
 }

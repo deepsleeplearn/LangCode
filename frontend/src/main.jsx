@@ -207,7 +207,20 @@ const MODEL_OPTIONS = [
     label: 'AIMP GLM-5',
     supportsThinking: true,
   },
-  { value: 'openai:gpt-4o:aimp', provider: 'openai', model: 'gpt-4o', gateway: 'aimp', label: 'AIMP GPT-4o' },
+  {
+    value: 'openai:kimi-k3:aimp-kimi-k3',
+    provider: 'openai',
+    model: 'kimi-k3',
+    gateway: 'aimp-kimi-k3',
+    label: 'AIMP Kimi K3',
+  },
+  {
+    value: 'openai:qwen3.8-max:aimp-qwen3.8-max',
+    provider: 'openai',
+    model: 'qwen3.8-max',
+    gateway: 'aimp-qwen3.8-max',
+    label: 'AIMP Qwen3.8 Max',
+  },
   {
     value: 'openai:deepseek-v4-pro:aimp-deepseek-v4-pro',
     provider: 'openai',

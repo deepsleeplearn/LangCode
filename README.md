@@ -180,18 +180,31 @@ export LANGCODE_MODEL="glm-5.1"
 
 不要把真实 API key 放进 tracked 文件。请使用 shell 环境变量，或使用被忽略的本地 env 文件。
 
-也支持 AIMP 网关的 GPT-4o。该接口按 OpenAI-compatible chat completions 接入，并额外发送 `Aimp-Biz-Id` 和 `AIGC-USER` headers：
+Kimi K3 使用同一套 OpenAI-compatible Chat Completions 接口，并支持 Agent 工具调用：
 
 ```bash
 export LANGCODE_PROVIDER="openai"
-export LANGCODE_OPENAI_GATEWAY="aimp"
-export LANGCODE_MODEL="gpt-4o"
-export AIMP_GPT4O_BASE_URL="https://aimpapi.midea.com/t-aigc/mip-chat-app/openai/standard/v1"
-export AIMP_GPT4O_USER="..."
-export AIMP_GPT4O_API_KEY="..."
+export LANGCODE_OPENAI_GATEWAY="aimp-kimi-k3"
+export LANGCODE_MODEL="kimi-k3"
+export AIMP_KIMI_K3_BASE_URL="https://aimpapi.midea.com/t-aigc/mip-chat-app/openai/v1"
+export AIMP_KIMI_K3_USER="你的 MIP 账号"
+export AIMP_KIMI_K3_API_KEY="你的 API key"
 ```
 
-Web 左下角设置里的模型下拉框可直接选择 `AIMP GPT-4o`。
+Web 模型下拉框中选择 `AIMP Kimi K3` 即可切换。
+
+Qwen3.8 Max 同样使用 OpenAI-compatible Chat Completions 接口，并支持 Agent 工具调用：
+
+```bash
+export LANGCODE_PROVIDER="openai"
+export LANGCODE_OPENAI_GATEWAY="aimp-qwen3.8-max"
+export LANGCODE_MODEL="qwen3.8-max"
+export AIMP_QWEN3_8_MAX_BASE_URL="https://aimpapi.midea.com/t-aigc/mip-chat-app/openai/v1"
+export AIMP_QWEN3_8_MAX_USER="你的 MIP 账号"
+export AIMP_QWEN3_8_MAX_API_KEY="你的 API key"
+```
+
+Web 模型下拉框中选择 `AIMP Qwen3.8 Max` 即可切换。
 
 Web 搜索/抓取使用 LangChain 官方 Tavily 集成 `langchain-tavily`：
 

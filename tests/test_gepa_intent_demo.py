@@ -32,9 +32,9 @@ def clear_model_env(monkeypatch) -> None:
         "AIMP_DEEPSEEK_V4_API_KEY",
         "AIMP_DEEPSEEK_V4_BASE_URL",
         "AIMP_DEEPSEEK_V4_USER",
-        "AIMP_GPT4O_API_KEY",
-        "AIMP_GPT4O_BASE_URL",
-        "AIMP_GPT4O_USER",
+        "AIMP_QWEN3_8_MAX_API_KEY",
+        "AIMP_QWEN3_8_MAX_BASE_URL",
+        "AIMP_QWEN3_8_MAX_USER",
         "AIGC_USER",
     ):
         monkeypatch.delenv(key, raising=False)
@@ -70,18 +70,18 @@ def test_model_config_maps_deepseek_to_aimp_deepseek_env(monkeypatch, tmp_path) 
     assert cfg["headers"] == {"AIGC-USER": "guojian34"}
 
 
-def test_model_config_maps_gpt4o_to_aimp_gpt4o_env(monkeypatch, tmp_path) -> None:
+def test_model_config_maps_qwen_to_aimp_qwen_env(monkeypatch, tmp_path) -> None:
     monkeypatch.setattr(gepa_intent_demo, "PROJECT_ROOT", tmp_path)
     clear_model_env(monkeypatch)
-    monkeypatch.setenv("AIMP_GPT4O_API_KEY", "gpt-key")
-    monkeypatch.setenv("AIMP_GPT4O_USER", "guojian34")
+    monkeypatch.setenv("AIMP_QWEN3_8_MAX_API_KEY", "qwen-key")
+    monkeypatch.setenv("AIMP_QWEN3_8_MAX_USER", "guojian34")
 
-    cfg = gepa_intent_demo.model_config("gpt-4o")
+    cfg = gepa_intent_demo.model_config("qwen3.8-max")
 
-    assert cfg["model"] == "gpt-4o"
-    assert cfg["api_base"] == "https://aimpapi.midea.com/t-aigc/mip-chat-app/openai/standard/v1"
-    assert cfg["api_key"] == "gpt-key"
-    assert cfg["headers"] == {"Aimp-Biz-Id": "gpt-4o", "AIGC-USER": "guojian34"}
+    assert cfg["model"] == "qwen3.8-max"
+    assert cfg["api_base"] == "https://aimpapi.midea.com/t-aigc/mip-chat-app/openai/v1"
+    assert cfg["api_key"] == "qwen-key"
+    assert cfg["headers"] == {"Aimp-Biz-Id": "qwen3.8-max", "AIGC-USER": "guojian34"}
 
 
 def test_make_lm_sets_non_streaming_dspy_lm() -> None:

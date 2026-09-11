@@ -267,15 +267,24 @@ def model_settings_from_env() -> ModelSettings:
             base_url=os.getenv("ZHIPU_BASE_URL") or "https://open.bigmodel.cn/api/paas/v4",
             api_key=os.getenv("ZHIPU_API_KEY") or os.getenv("OPENAI_API_KEY"),
         )
-    model = os.getenv("LANGCODE_MODEL") or os.getenv("OPENAI_MODEL") or "gpt-4o-mini"
-    if provider == "openai" and _openai_gateway_from_env() == "aimp":
-        aimp_model = os.getenv("AIMP_GPT4O_MODEL") or (model if model.startswith("gpt-") else "gpt-4o")
+    model = os.getenv("LANGCODE_MODEL") or os.getenv("OPENAI_MODEL") or "glm-5.1"
+    if provider == "openai" and _openai_gateway_from_env() == "aimp-kimi-k3":
+        kimi_model = os.getenv("AIMP_KIMI_K3_MODEL") or "kimi-k3"
         return ModelSettings(
             provider="openai",
-            model=aimp_model,
-            base_url=_aimp_base_url(),
-            api_key=os.getenv("AIMP_GPT4O_API_KEY"),
-            default_headers=_aimp_headers(aimp_model),
+            model=kimi_model,
+            base_url=_aimp_kimi_base_url(),
+            api_key=os.getenv("AIMP_KIMI_K3_API_KEY"),
+            default_headers=_aimp_kimi_headers(),
+        )
+    if provider == "openai" and _openai_gateway_from_env() == "aimp-qwen3.8-max":
+        qwen_model = os.getenv("AIMP_QWEN3_8_MAX_MODEL") or "qwen3.8-max"
+        return ModelSettings(
+            provider="openai",
+            model=qwen_model,
+            base_url=_aimp_qwen_base_url(),
+            api_key=os.getenv("AIMP_QWEN3_8_MAX_API_KEY"),
+            default_headers=_aimp_qwen_headers(),
         )
     if provider == "openai" and _openai_gateway_from_env() == "aimp-deepseek-v4-pro":
         deepseek_model = os.getenv("AIMP_DEEPSEEK_V4_MODEL") or (
@@ -307,17 +316,6 @@ def model_settings_from_env() -> ModelSettings:
     )
 
 
-def _aimp_base_url() -> str:
-    configured = (
-        os.getenv("AIMP_GPT4O_BASE_URL")
-        or "https://aimpapi.midea.com/t-aigc/mip-chat-app/openai/standard/v1"
-    ).rstrip("/")
-    suffix = "/chat/completions"
-    if configured.endswith(suffix):
-        return configured[: -len(suffix)]
-    return configured
-
-
 def _aimp_deepseek_base_url() -> str:
     configured = (
         os.getenv("AIMP_DEEPSEEK_V4_BASE_URL")
@@ -327,6 +325,24 @@ def _aimp_deepseek_base_url() -> str:
     if configured.endswith(suffix):
         return configured[: -len(suffix)]
     return configured
+
+
+def _aimp_kimi_base_url() -> str:
+    configured = (
+        os.getenv("AIMP_KIMI_K3_BASE_URL")
+        or "https://aimpapi.midea.com/t-aigc/mip-chat-app/openai/v1"
+    ).rstrip("/")
+    suffix = "/chat/completions"
+    return configured[: -len(suffix)] if configured.endswith(suffix) else configured
+
+
+def _aimp_qwen_base_url() -> str:
+    configured = (
+        os.getenv("AIMP_QWEN3_8_MAX_BASE_URL")
+        or "https://aimpapi.midea.com/t-aigc/mip-chat-app/openai/v1"
+    ).rstrip("/")
+    suffix = "/chat/completions"
+    return configured[: -len(suffix)] if configured.endswith(suffix) else configured
 
 
 def _aimp_glm_base_url() -> str:
@@ -344,17 +360,25 @@ def _openai_gateway_from_env() -> str:
     return (os.getenv("LANGCODE_OPENAI_GATEWAY") or "").lower()
 
 
-def _aimp_headers(model: str) -> dict[str, str]:
-    headers = {"Aimp-Biz-Id": model}
-    user = os.getenv("AIMP_GPT4O_USER") or ""
+def _aimp_deepseek_headers() -> dict[str, str]:
+    user = os.getenv("AIMP_DEEPSEEK_V4_USER") or os.getenv("AIGC_USER") or ""
+    return {"AIGC-USER": user} if user else {}
+
+
+def _aimp_kimi_headers() -> dict[str, str]:
+    headers = {"Aimp-Biz-Id": "kimi-k3"}
+    user = os.getenv("AIMP_KIMI_K3_USER") or os.getenv("AIGC_USER") or ""
     if user:
         headers["AIGC-USER"] = user
     return headers
 
 
-def _aimp_deepseek_headers() -> dict[str, str]:
-    user = os.getenv("AIMP_DEEPSEEK_V4_USER") or os.getenv("AIGC_USER") or ""
-    return {"AIGC-USER": user} if user else {}
+def _aimp_qwen_headers() -> dict[str, str]:
+    headers = {"Aimp-Biz-Id": "qwen3.8-max"}
+    user = os.getenv("AIMP_QWEN3_8_MAX_USER") or os.getenv("AIGC_USER") or ""
+    if user:
+        headers["AIGC-USER"] = user
+    return headers
 
 
 def _aimp_glm_headers() -> dict[str, str]:

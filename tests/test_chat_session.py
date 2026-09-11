@@ -151,10 +151,10 @@ def test_chat_session_executes_model_tool_call_with_approval(tmp_path: Path) -> 
     assert (tmp_path / "README.md").read_text(encoding="utf-8") == "from chat"
 
 
-def test_aimp_glm_is_default_openai_compatible_provider(monkeypatch) -> None:
-    monkeypatch.delenv("LANGCODE_PROVIDER", raising=False)
-    monkeypatch.delenv("LANGCODE_OPENAI_GATEWAY", raising=False)
-    monkeypatch.delenv("LANGCODE_MODEL", raising=False)
+def test_aimp_glm_provider_adds_headers_and_thinking_body(monkeypatch) -> None:
+    monkeypatch.setenv("LANGCODE_PROVIDER", "openai")
+    monkeypatch.setenv("LANGCODE_OPENAI_GATEWAY", "aimp-glm")
+    monkeypatch.setenv("LANGCODE_MODEL", "glm-5")
     monkeypatch.delenv("AIMP_GLM_BASE_URL", raising=False)
     monkeypatch.setenv("AIMP_GLM_API_KEY", "glm-key")
     monkeypatch.setenv("AIMP_GLM_USER", "user-glm")
@@ -188,40 +188,50 @@ def test_openai_provider_can_still_be_selected(monkeypatch) -> None:
     assert settings.api_key == "openai-key"
 
 
-def test_aimp_gpt4o_provider_adds_gateway_headers(monkeypatch) -> None:
+def test_aimp_kimi_k3_provider_adds_headers_and_normalizes_url(monkeypatch) -> None:
     monkeypatch.setenv("LANGCODE_PROVIDER", "openai")
-    monkeypatch.setenv("LANGCODE_OPENAI_GATEWAY", "aimp")
-    monkeypatch.delenv("LANGCODE_MODEL", raising=False)
-    monkeypatch.delenv("AIMP_GPT4O_BASE_URL", raising=False)
-    monkeypatch.setenv("AIMP_GPT4O_API_KEY", "aimp-key")
-    monkeypatch.setenv("AIMP_GPT4O_USER", "user-1")
+    monkeypatch.setenv("LANGCODE_OPENAI_GATEWAY", "aimp-kimi-k3")
+    monkeypatch.setenv("LANGCODE_MODEL", "kimi-k3")
+    monkeypatch.setenv(
+        "AIMP_KIMI_K3_BASE_URL",
+        "https://aimpapi.midea.com/t-aigc/mip-chat-app/openai/v1/chat/completions",
+    )
+    monkeypatch.setenv("AIMP_KIMI_K3_API_KEY", "kimi-key")
+    monkeypatch.setenv("AIMP_KIMI_K3_USER", "user-kimi")
 
     settings = model_settings_from_env()
 
     assert settings.provider == "openai"
-    assert settings.base_url == "https://aimpapi.midea.com/t-aigc/mip-chat-app/openai/standard/v1"
-    assert settings.model == "gpt-4o"
-    assert settings.api_key == "aimp-key"
+    assert settings.base_url == "https://aimpapi.midea.com/t-aigc/mip-chat-app/openai/v1"
+    assert settings.model == "kimi-k3"
+    assert settings.api_key == "kimi-key"
     assert settings.default_headers == {
-        "Aimp-Biz-Id": "gpt-4o",
-        "AIGC-USER": "user-1",
+        "Aimp-Biz-Id": "kimi-k3",
+        "AIGC-USER": "user-kimi",
     }
 
 
-def test_aimp_base_url_accepts_full_chat_completions_endpoint(monkeypatch) -> None:
+def test_aimp_qwen3_8_max_provider_adds_headers_and_normalizes_url(monkeypatch) -> None:
     monkeypatch.setenv("LANGCODE_PROVIDER", "openai")
-    monkeypatch.setenv("LANGCODE_OPENAI_GATEWAY", "aimp")
-    monkeypatch.setenv("LANGCODE_MODEL", "gpt-4o")
+    monkeypatch.setenv("LANGCODE_OPENAI_GATEWAY", "aimp-qwen3.8-max")
+    monkeypatch.setenv("LANGCODE_MODEL", "qwen3.8-max")
     monkeypatch.setenv(
-        "AIMP_GPT4O_BASE_URL",
-        "https://aimpapi.midea.com/t-aigc/mip-chat-app/openai/standard/v1/chat/completions",
+        "AIMP_QWEN3_8_MAX_BASE_URL",
+        "https://aimpapi.midea.com/t-aigc/mip-chat-app/openai/v1/chat/completions",
     )
-    monkeypatch.setenv("AIMP_GPT4O_API_KEY", "aimp-key")
+    monkeypatch.setenv("AIMP_QWEN3_8_MAX_API_KEY", "qwen-key")
+    monkeypatch.setenv("AIMP_QWEN3_8_MAX_USER", "user-qwen")
 
     settings = model_settings_from_env()
 
     assert settings.provider == "openai"
-    assert settings.base_url == "https://aimpapi.midea.com/t-aigc/mip-chat-app/openai/standard/v1"
+    assert settings.base_url == "https://aimpapi.midea.com/t-aigc/mip-chat-app/openai/v1"
+    assert settings.model == "qwen3.8-max"
+    assert settings.api_key == "qwen-key"
+    assert settings.default_headers == {
+        "Aimp-Biz-Id": "qwen3.8-max",
+        "AIGC-USER": "user-qwen",
+    }
 
 
 def test_aimp_deepseek_v4_provider_adds_headers_and_thinking_body(monkeypatch) -> None:
@@ -698,7 +708,7 @@ def test_chat_session_stops_at_tool_round_limit(tmp_path: Path, monkeypatch) -> 
 
 
 class FakeSummaryModel:
-    model_name = "gpt-4o-mini"
+    model_name = "qwen3.8-max"
 
     def __init__(self, summary: str = "摘要：讨论了 A 与 B，待办是 C。") -> None:
         self.calls = 0
@@ -725,8 +735,8 @@ def _long_history(turns: int = 12) -> list:
 def test_count_messages_tokens_grows_with_history() -> None:
     history = _long_history(4)
 
-    assert count_messages_tokens(history[:5], "gpt-4o-mini") < count_messages_tokens(history, "gpt-4o-mini")
-    assert count_messages_tokens([], "gpt-4o-mini") == 0
+    assert count_messages_tokens(history[:5], "qwen3.8-max") < count_messages_tokens(history, "qwen3.8-max")
+    assert count_messages_tokens([], "qwen3.8-max") == 0
 
 
 def test_compact_history_leaves_short_history_untouched() -> None:
@@ -755,7 +765,7 @@ def test_compact_history_summarizes_older_segment() -> None:
     assert "摘要：讨论了 A 与 B" in result[1].content
     assert result[2].content == CONTEXT_SUMMARY_ACK
     assert len(result) < len(history)
-    assert count_messages_tokens(result, "gpt-4o-mini") <= 2000
+    assert count_messages_tokens(result, "qwen3.8-max") <= 2000
 
 
 def test_compact_history_keeps_tool_messages_paired() -> None:
@@ -774,7 +784,7 @@ def test_compact_history_keeps_tool_messages_paired() -> None:
 
 def test_compact_history_keeps_full_history_when_summary_raises() -> None:
     class BrokenSummaryModel:
-        model_name = "gpt-4o-mini"
+        model_name = "qwen3.8-max"
 
         def invoke(self, _messages):
             raise RuntimeError("summary backend down")
@@ -792,7 +802,7 @@ def test_compact_history_keeps_full_history_when_summary_raises() -> None:
 
 def test_compact_history_keeps_full_history_when_summary_is_empty() -> None:
     class EmptySummaryModel:
-        model_name = "gpt-4o-mini"
+        model_name = "qwen3.8-max"
 
         def __init__(self) -> None:
             self.calls = 0
@@ -825,7 +835,7 @@ def test_compact_history_summarizes_with_the_unbound_model() -> None:
             return AIMessage(content="", tool_calls=[{"name": "ls", "args": {}, "id": "x"}])
 
     inner = FakeSummaryModel()
-    inner.model_name = "gpt-4o-mini"
+    inner.model_name = "qwen3.8-max"
 
     result, compacted = compact_history_if_needed(
         _long_history(), model=Binding(inner), max_tokens=2000, keep_recent_tokens=600
@@ -845,7 +855,7 @@ def test_large_inline_image_parts_are_counted_towards_the_budget() -> None:
         ]
     )
 
-    tokens = count_messages_tokens([message], "gpt-4o-mini")
+    tokens = count_messages_tokens([message], "qwen3.8-max")
 
     # ~len/4 for the blob; before the fix the image part cost ~0 tokens.
     assert tokens > 90_000
@@ -862,13 +872,13 @@ def test_token_counts_are_consistent_between_window_split_and_budget() -> None:
     from langcode_agent.core.context_management import _TokenCounter, _recent_window_start
 
     body = _long_history(6)[1:]
-    counter = _TokenCounter("gpt-4o-mini")
+    counter = _TokenCounter("qwen3.8-max")
     split = _recent_window_start(body, 600, counter)
 
-    assert count_messages_tokens(body[split:], "gpt-4o-mini") == counter.total(body[split:])
+    assert count_messages_tokens(body[split:], "qwen3.8-max") == counter.total(body[split:])
     # Tool-calling AIMessages carry tool_calls tokens the old split ignored.
     assert counter.total(body) > sum(
-        _TokenCounter("gpt-4o-mini").message_tokens(message) for message in body if not getattr(message, "tool_calls", None)
+        _TokenCounter("qwen3.8-max").message_tokens(message) for message in body if not getattr(message, "tool_calls", None)
     )
 
 
@@ -883,7 +893,7 @@ def test_compact_history_handles_list_content_parts() -> None:
     )
 
     assert compacted is True
-    assert count_messages_tokens(result, "gpt-4o-mini") <= 2000
+    assert count_messages_tokens(result, "qwen3.8-max") <= 2000
 
 
 def test_compact_history_reads_budgets_from_env(monkeypatch) -> None:

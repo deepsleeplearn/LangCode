@@ -36,7 +36,7 @@ REQUIRED_FILES = [
 ]
 
 REQUIRED_GITIGNORE_PATTERNS = [
-    "/*.md",
+    "markdown/",
     "!/README.md",
     "docs/",
     ".env",
@@ -72,6 +72,7 @@ EXCLUDED_DIRS = {
     "node_modules",
     "dist",
     "docs",
+    "markdown",
 }
 
 SECRET_PATTERNS = [
